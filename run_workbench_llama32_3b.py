@@ -47,6 +47,7 @@ DEFAULT_QUERIES_PATH = os.path.join(
     "queries_and_answers",
     "calendar_queries_and_answers.csv",
 )
+AGENT_BASELINE_CHOICES = ("tool_calling", "react")
 
 DOMAINS = [calendar, email, analytics, project_management, customer_relationship_manager]
 
@@ -346,9 +347,15 @@ def parse_args() -> argparse.Namespace:
         help="Use all tools or only domain-relevant tools from the CSV.",
     )
     parser.add_argument(
+        "--agent_baseline",
+        choices=list(AGENT_BASELINE_CHOICES),
+        default="tool_calling",
+        help="Agent loop to use: native tool calling or ReAct-style text actions.",
+    )
+    parser.add_argument(
         "--max_iterations",
         type=int,
-        default=12,
+        default=20,
         help="Maximum number of assistant/tool turns per query.",
     )
     parser.add_argument(
@@ -463,7 +470,7 @@ def build_quantization_config(load_in_4bit: bool, load_in_8bit: bool):
     return BitsAndBytesConfig(load_in_8bit=True)
 
 
-def build_system_prompt() -> str:
+def build_base_system_prompt() -> str:
     return (
         f"Today's date is {HARDCODED_CURRENT_TIME.strftime('%A')}, "
         f"{HARDCODED_CURRENT_TIME.date()} and the current time is "
@@ -471,9 +478,58 @@ def build_system_prompt() -> str:
         "Remember the current date and time when answering queries. "
         "Meetings must not start before 9am or end after 6pm. "
         "Use the available tools to complete the user's request. "
-        "When a tool is needed, return a tool call. "
+    )
+
+
+def build_tool_calling_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "When a tool is needed, return a tool call. "
         "When you have finished all necessary tool calls, provide a brief final answer."
     )
+
+
+def format_tools_for_react_prompt(tools: list[Any]) -> str:
+    formatted_tools: list[str] = []
+    for fn in tools:
+        schema = fn.openai_schema["function"]
+        properties = schema.get("parameters", {}).get("properties", {})
+        parameter_parts = []
+        for name, metadata in properties.items():
+            param_type = metadata.get("type", "any")
+            description = metadata.get("description", "")
+            parameter_parts.append(f"{name} ({param_type}): {description}")
+
+        params_text = "; ".join(parameter_parts) if parameter_parts else "No arguments."
+        formatted_tools.append(
+            f"- {schema['name']}: {schema.get('description', '')}\n"
+            f"  Arguments: {params_text}"
+        )
+    return "\n".join(formatted_tools)
+
+
+def build_react_system_prompt(tools: list[Any]) -> str:
+    return (
+        build_base_system_prompt()
+        + "You are using a ReAct-style loop. Think step by step, but do not rely on hidden tools. "
+        + "If you need a tool, respond with exactly one action using this format:\n"
+        + "Thought: <brief reasoning>\n"
+        + "Action:\n"
+        + '{"name": "tool_name", "arguments": {"arg": "value"}}\n'
+        + "After you receive an observation, continue reasoning and either call one more tool or finish with:\n"
+        + "Thought: <brief reasoning>\n"
+        + "Final Answer: <brief answer>\n\n"
+        + "Available tools:\n"
+        + format_tools_for_react_prompt(tools)
+    )
+
+
+def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
+    if agent_baseline == "tool_calling":
+        return build_tool_calling_system_prompt()
+    if agent_baseline == "react":
+        return build_react_system_prompt(tools)
+    raise ValueError(f"Unknown agent baseline: {agent_baseline}")
 
 
 def decode_new_tokens(
@@ -547,16 +603,17 @@ def generate_assistant_turn(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
     max_new_tokens: int,
     model_id: str,
 ) -> str:
     chat_template_kwargs: dict[str, Any] = {
-        "tools": tools,
         "add_generation_prompt": True,
         "return_dict": True,
         "return_tensors": "pt",
     }
+    if tools is not None:
+        chat_template_kwargs["tools"] = tools
     if is_qwen3_model(model_id):
         # Qwen3 tool use is more reliable with thinking disabled.
         chat_template_kwargs["enable_thinking"] = False
@@ -660,6 +717,104 @@ def run_hf_agent(
     )
 
 
+def run_react_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+) -> tuple[list[str], str, str]:
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": query},
+    ]
+    function_calls: list[str] = []
+    full_response_parts: list[str] = []
+
+    for _ in range(max_iterations):
+        assistant_text = generate_assistant_turn(
+            model=model,
+            tokenizer=tokenizer,
+            messages=messages,
+            tools=None,
+            max_new_tokens=max_new_tokens,
+            model_id=model_id,
+        )
+        full_response_parts.append(assistant_text)
+        messages.append({"role": "assistant", "content": assistant_text})
+
+        parsed_tool_calls = parse_tool_calls(assistant_text)
+        if not parsed_tool_calls:
+            return function_calls, "\n".join(full_response_parts), ""
+
+        tool_name, tool_args = parsed_tool_calls[0]
+        function_calls.append(convert_tool_call_to_function_call(tool_name, tool_args))
+
+        fn = _TOOL_REGISTRY.get(tool_name)
+        if fn is None:
+            tool_result = f"Unknown tool: {tool_name}"
+        else:
+            try:
+                tool_result = str(fn(**tool_args))
+            except Exception as exc:
+                tool_result = f"Error executing tool: {exc}"
+
+        observation = f"Observation:\n{tool_result}"
+        full_response_parts.append(observation)
+        messages.append({"role": "user", "content": observation})
+
+    return (
+        function_calls,
+        "\n".join(full_response_parts),
+        "Agent stopped due to iteration limit.",
+    )
+
+
+def run_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+    agent_baseline: str,
+) -> tuple[list[str], str, str]:
+    if agent_baseline == "tool_calling":
+        return run_hf_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+        )
+    if agent_baseline == "react":
+        return run_react_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+        )
+    raise ValueError(f"Unknown agent baseline: {agent_baseline}")
+
+
+def build_results_mode_label(tool_selection: str, agent_baseline: str) -> str:
+    if agent_baseline == "tool_calling":
+        return tool_selection
+    return f"{tool_selection}_{agent_baseline}"
+
+
 def load_model_and_tokenizer(
     model_id: str,
     load_in_4bit: bool = False,
@@ -697,8 +852,12 @@ def load_model_and_tokenizer(
     return model, tokenizer
 
 
-def get_query_tools(queries_df: pd.DataFrame, index: int, tool_selection: str) -> list[Any]:
-    if tool_selection != "domains":
+def get_query_tools(
+    queries_df: pd.DataFrame,
+    index: int,
+    tool_selection: str,
+) -> list[Any]:
+    if tool_selection == "all":
         return get_toolkits(
             [
                 "email",
@@ -709,14 +868,17 @@ def get_query_tools(queries_df: pd.DataFrame, index: int, tool_selection: str) -
             ]
         )
 
-    query_toolkits = (
-        queries_df["domains"]
-        .iloc[index]
-        .strip("][")
-        .replace("'", "")
-        .split(", ")
-    )
-    return get_toolkits(query_toolkits)
+    if tool_selection == "domains":
+        query_toolkits = (
+            queries_df["domains"]
+            .iloc[index]
+            .strip("][")
+            .replace("'", "")
+            .split(", ")
+        )
+        return get_toolkits(query_toolkits)
+
+    raise ValueError(f"Unknown tool selection mode: {tool_selection}")
 
 
 def generate_results_with_hf(
@@ -726,6 +888,7 @@ def generate_results_with_hf(
     queries_path: str,
     model_label: str,
     tool_selection: str,
+    agent_baseline: str,
     max_iterations: int,
     max_new_tokens: int,
     num_retries: int,
@@ -736,11 +899,15 @@ def generate_results_with_hf(
     if num_queries is not None:
         queries_df = queries_df.head(num_queries).copy()
     queries = queries_df["query"].tolist()
-    system_prompt = build_system_prompt()
-
     if print_first_prompt and queries:
+        first_tools = get_query_tools(
+            queries_df,
+            0,
+            tool_selection,
+        )
+        first_system_prompt = build_system_prompt(agent_baseline, first_tools)
         print("### System prompt:")
-        print(system_prompt)
+        print(first_system_prompt)
         print("\n### First user query:")
         print(queries[0])
         print()
@@ -748,13 +915,18 @@ def generate_results_with_hf(
     results = pd.DataFrame(columns=["query", "function_calls", "full_response", "error"])
 
     for index, query in enumerate(queries):
-        tools = get_query_tools(queries_df, index, tool_selection)
+        tools = get_query_tools(
+            queries_df,
+            index,
+            tool_selection,
+        )
+        system_prompt = build_system_prompt(agent_baseline, tools)
         function_calls: list[str] = []
         full_response = ""
         error = ""
 
         try:
-            function_calls, full_response, error = run_hf_agent(
+            function_calls, full_response, error = run_agent(
                 model=model,
                 tokenizer=tokenizer,
                 model_id=model_id,
@@ -763,12 +935,13 @@ def generate_results_with_hf(
                 system_prompt=system_prompt,
                 max_iterations=max_iterations,
                 max_new_tokens=max_new_tokens,
+                agent_baseline=agent_baseline,
             )
 
             if not function_calls:
                 for retry_num in range(num_retries):
                     print(f"No actions taken. Retry {retry_num + 1} of {num_retries}")
-                    function_calls, full_response, error = run_hf_agent(
+                    function_calls, full_response, error = run_agent(
                         model=model,
                         tokenizer=tokenizer,
                         model_id=model_id,
@@ -777,6 +950,7 @@ def generate_results_with_hf(
                         system_prompt=system_prompt,
                         max_iterations=max_iterations,
                         max_new_tokens=max_new_tokens,
+                        agent_baseline=agent_baseline,
                     )
                     if function_calls:
                         break
@@ -810,7 +984,8 @@ def generate_results_with_hf(
     save_dir = os.path.join(WORKBENCH_ROOT, "data", "results", domain)
     os.makedirs(save_dir, exist_ok=True)
     current_datetime = str(pd.Timestamp.now()).split(".")[0].replace(" ", "_").replace(":", "-")
-    save_path = os.path.join(save_dir, f"{model_label}_{tool_selection}_{current_datetime}.csv")
+    mode_label = build_results_mode_label(tool_selection, agent_baseline)
+    save_path = os.path.join(save_dir, f"{model_label}_{mode_label}_{current_datetime}.csv")
     results.to_csv(save_path, index=False, quoting=csv.QUOTE_ALL)
     print(f"\nSaved results to: {save_path}")
     return results
@@ -834,6 +1009,7 @@ def main() -> None:
         queries_path=args.queries_path,
         model_label=args.model_label,
         tool_selection=args.tool_selection,
+        agent_baseline=args.agent_baseline,
         max_iterations=args.max_iterations,
         max_new_tokens=args.max_new_tokens,
         num_retries=args.num_retries,
