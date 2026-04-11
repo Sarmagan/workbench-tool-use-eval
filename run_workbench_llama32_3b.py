@@ -47,7 +47,7 @@ DEFAULT_QUERIES_PATH = os.path.join(
     "queries_and_answers",
     "calendar_queries_and_answers.csv",
 )
-AGENT_BASELINE_CHOICES = ("tool_calling", "react")
+AGENT_BASELINE_CHOICES = ("tool_calling", "react", "plan_then_act")
 
 DOMAINS = [calendar, email, analytics, project_management, customer_relationship_manager]
 
@@ -350,7 +350,7 @@ def parse_args() -> argparse.Namespace:
         "--agent_baseline",
         choices=list(AGENT_BASELINE_CHOICES),
         default="tool_calling",
-        help="Agent loop to use: native tool calling or ReAct-style text actions.",
+        help="Agent loop to use: native tool calling, a plan-then-act variant, or ReAct-style text actions.",
     )
     parser.add_argument(
         "--max_iterations",
@@ -489,7 +489,18 @@ def build_tool_calling_system_prompt() -> str:
     )
 
 
-def format_tools_for_react_prompt(tools: list[Any]) -> str:
+def build_plan_then_act_planning_system_prompt(tools: list[Any]) -> str:
+    return (
+        build_base_system_prompt()
+        + "You are in a planning-only phase. Do not call tools. "
+        + "Return a short plan in 1-3 brief bullet points that references the available tools when useful. "
+        + "Do not include JSON, tool-call syntax, or a final answer.\n\n"
+        + "Available tools:\n"
+        + format_tools_for_text_prompt(tools)
+    )
+
+
+def format_tools_for_text_prompt(tools: list[Any]) -> str:
     formatted_tools: list[str] = []
     for fn in tools:
         schema = fn.openai_schema["function"]
@@ -520,12 +531,24 @@ def build_react_system_prompt(tools: list[Any]) -> str:
         + "Thought: <brief reasoning>\n"
         + "Final Answer: <brief answer>\n\n"
         + "Available tools:\n"
-        + format_tools_for_react_prompt(tools)
+        + format_tools_for_text_prompt(tools)
+    )
+
+
+def build_plan_then_act_execution_user_prompt(query: str, plan_text: str) -> str:
+    return (
+        "User request:\n"
+        + query
+        + "\n\nDraft plan:\n"
+        + plan_text
+        + "\n\nUse the plan if it helps, but update it if tool results suggest a better approach."
     )
 
 
 def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
     if agent_baseline == "tool_calling":
+        return build_tool_calling_system_prompt()
+    if agent_baseline == "plan_then_act":
         return build_tool_calling_system_prompt()
     if agent_baseline == "react":
         return build_react_system_prompt(tools)
@@ -702,7 +725,7 @@ def run_hf_agent(
                 }
             )
 
-        messages.append(
+        execution_messages.append(
             {
                 "role": "assistant",
                 "tool_calls": assistant_tool_calls,
@@ -773,6 +796,107 @@ def run_react_agent(
     )
 
 
+def run_plan_then_act_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+) -> tuple[list[str], str, str]:
+    tool_schemas = [fn.openai_schema for fn in tools]
+    planning_messages: list[dict[str, Any]] = [
+        {"role": "system", "content": build_plan_then_act_planning_system_prompt(tools)},
+        {"role": "user", "content": query},
+    ]
+    function_calls: list[str] = []
+    full_response_parts: list[str] = []
+
+    plan_text = generate_assistant_turn(
+        model=model,
+        tokenizer=tokenizer,
+        messages=planning_messages,
+        tools=None,
+        max_new_tokens=max_new_tokens,
+        model_id=model_id,
+    )
+    full_response_parts.append(f"Plan:\n{plan_text}")
+
+    execution_messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": build_plan_then_act_execution_user_prompt(query, plan_text),
+        }
+    ]
+
+    for _ in range(max_iterations):
+        assistant_text = generate_assistant_turn(
+            model=model,
+            tokenizer=tokenizer,
+            messages=execution_messages,
+            tools=tool_schemas,
+            max_new_tokens=max_new_tokens,
+            model_id=model_id,
+        )
+        full_response_parts.append(assistant_text)
+
+        parsed_tool_calls = parse_tool_calls(assistant_text)
+        if not parsed_tool_calls:
+            return function_calls, "\n".join(full_response_parts), ""
+
+        assistant_tool_calls = []
+        tool_result_messages = []
+
+        for tool_name, tool_args in parsed_tool_calls:
+            function_calls.append(convert_tool_call_to_function_call(tool_name, tool_args))
+            assistant_tool_calls.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": tool_args,
+                    },
+                }
+            )
+
+            fn = _TOOL_REGISTRY.get(tool_name)
+            if fn is None:
+                tool_result = f"Unknown tool: {tool_name}"
+            else:
+                try:
+                    tool_result = str(fn(**tool_args))
+                except Exception as exc:
+                    tool_result = f"Error executing tool: {exc}"
+
+            tool_result_messages.append(
+                {
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": tool_result,
+                }
+            )
+
+        execution_messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": assistant_tool_calls,
+            }
+        )
+        execution_messages.extend(tool_result_messages)
+
+    return (
+        function_calls,
+        "\n".join(full_response_parts),
+        "Agent stopped due to iteration limit.",
+    )
+
+
 def run_agent(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -786,6 +910,17 @@ def run_agent(
 ) -> tuple[list[str], str, str]:
     if agent_baseline == "tool_calling":
         return run_hf_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+        )
+    if agent_baseline == "plan_then_act":
+        return run_plan_then_act_agent(
             model=model,
             tokenizer=tokenizer,
             model_id=model_id,
@@ -905,9 +1040,15 @@ def generate_results_with_hf(
             0,
             tool_selection,
         )
-        first_system_prompt = build_system_prompt(agent_baseline, first_tools)
-        print("### System prompt:")
-        print(first_system_prompt)
+        if agent_baseline == "plan_then_act":
+            print("### Planning system prompt:")
+            print(build_plan_then_act_planning_system_prompt(first_tools))
+            print("\n### Execution system prompt:")
+            print(build_system_prompt(agent_baseline, first_tools))
+        else:
+            first_system_prompt = build_system_prompt(agent_baseline, first_tools)
+            print("### System prompt:")
+            print(first_system_prompt)
         print("\n### First user query:")
         print(queries[0])
         print()
