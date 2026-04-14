@@ -47,7 +47,13 @@ DEFAULT_QUERIES_PATH = os.path.join(
     "queries_and_answers",
     "calendar_queries_and_answers.csv",
 )
-AGENT_BASELINE_CHOICES = ("tool_calling", "react", "plan_then_act")
+AGENT_BASELINE_CHOICES = (
+    "tool_calling",
+    "react",
+    "plan_then_act",
+    "route_then_act",
+    "self_reflection",
+)
 
 DOMAINS = [calendar, email, analytics, project_management, customer_relationship_manager]
 
@@ -350,7 +356,7 @@ def parse_args() -> argparse.Namespace:
         "--agent_baseline",
         choices=list(AGENT_BASELINE_CHOICES),
         default="tool_calling",
-        help="Agent loop to use: native tool calling, a plan-then-act variant, or ReAct-style text actions.",
+        help="Agent loop to use: native tool calling, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
     )
     parser.add_argument(
         "--max_iterations",
@@ -500,6 +506,37 @@ def build_plan_then_act_planning_system_prompt(tools: list[Any]) -> str:
     )
 
 
+def build_route_then_act_routing_system_prompt(tools: list[Any]) -> str:
+    return (
+        build_base_system_prompt()
+        + "You are in a routing-only phase. Do not answer the user request and do not call tools. "
+        + "Choose the smallest executable subset of available tools that is likely sufficient to solve the request end to end. "
+        + "Select at least two tools. "
+        + "Include any prerequisite lookup, search, list, or read tools needed to discover required IDs, emails, names, or existing records before a write action. "
+        + "For update, delete, move, reassign, or status-change requests, include both a search/read tool and the corresponding write tool. "
+        + "If a person's email may need to be resolved, include the company directory tool. "
+        + "Prefer a slightly larger executable subset over a too-small subset that would block execution. "
+        + "Return exactly one JSON object with this schema and nothing else:\n"
+        + '{"selected_tools": ["exact_tool_name"]}\n\n'
+        + "Available tools:\n"
+        + format_tools_for_text_prompt(tools)
+    )
+
+
+def build_self_reflection_system_prompt(tools: list[Any]) -> str:
+    return (
+        build_base_system_prompt()
+        + "You are in a self-reflection phase. Do not call tools and do not answer the user request yet. "
+        + "Review the conversation so far, including any tool results, and write 2-4 short bullet points. "
+        + "Focus on missing information, risky assumptions, whether a write action is safe yet, and the single best next step. "
+        + "Mention exact tool names when useful. "
+        + "If the task is already complete, say that no more tools are needed. "
+        + "Do not include JSON or tool-call syntax.\n\n"
+        + "Available tools:\n"
+        + format_tools_for_text_prompt(tools)
+    )
+
+
 def format_tools_for_text_prompt(tools: list[Any]) -> str:
     formatted_tools: list[str] = []
     for fn in tools:
@@ -549,6 +586,10 @@ def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
     if agent_baseline == "tool_calling":
         return build_tool_calling_system_prompt()
     if agent_baseline == "plan_then_act":
+        return build_tool_calling_system_prompt()
+    if agent_baseline == "route_then_act":
+        return build_tool_calling_system_prompt()
+    if agent_baseline == "self_reflection":
         return build_tool_calling_system_prompt()
     if agent_baseline == "react":
         return build_react_system_prompt(tools)
@@ -620,6 +661,75 @@ def parse_tool_calls(text: str) -> list[tuple[str, dict[str, Any]]]:
             parsed_tool_calls.append(normalized)
 
     return parsed_tool_calls
+
+
+def get_tool_name(tool: Any) -> str:
+    return tool.openai_schema["function"]["name"]
+
+
+def get_tool_debug_name(tool: Any) -> str:
+    return _openai_name_to_internal(get_tool_name(tool))
+
+
+def parse_selected_tool_names(text: str, tools: list[Any]) -> list[str]:
+    available_names = {get_tool_name(tool) for tool in tools}
+
+    def normalize_selected_names(candidate: Any) -> list[str]:
+        if isinstance(candidate, str):
+            candidate = [part.strip() for part in candidate.split(",")]
+        if not isinstance(candidate, list):
+            return []
+
+        selected_names: list[str] = []
+        for name in candidate:
+            if isinstance(name, str) and name in available_names and name not in selected_names:
+                selected_names.append(name)
+        return selected_names
+
+    for payload in extract_json_candidates(text):
+        selected_names = normalize_selected_names(payload.get("selected_tools"))
+        if selected_names:
+            return selected_names
+
+        selected_names = normalize_selected_names(payload.get("tools"))
+        if selected_names:
+            return selected_names
+
+    selected_names = []
+    for tool in tools:
+        tool_name = get_tool_name(tool)
+        if tool_name in text and tool_name not in selected_names:
+            selected_names.append(tool_name)
+    return selected_names
+
+
+def select_route_then_act_tools(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    max_new_tokens: int,
+) -> tuple[list[Any], str]:
+    routing_messages: list[dict[str, Any]] = [
+        {"role": "system", "content": build_route_then_act_routing_system_prompt(tools)},
+        {"role": "user", "content": query},
+    ]
+    routing_text = generate_assistant_turn(
+        model=model,
+        tokenizer=tokenizer,
+        messages=routing_messages,
+        tools=None,
+        max_new_tokens=max_new_tokens,
+        model_id=model_id,
+    )
+
+    selected_tool_names = parse_selected_tool_names(routing_text, tools)
+    if not selected_tool_names:
+        return tools, routing_text
+
+    tool_by_name = {get_tool_name(tool): tool for tool in tools}
+    return [tool_by_name[name] for name in selected_tool_names], routing_text
 
 
 def generate_assistant_turn(
@@ -725,7 +835,7 @@ def run_hf_agent(
                 }
             )
 
-        execution_messages.append(
+        messages.append(
             {
                 "role": "assistant",
                 "tool_calls": assistant_tool_calls,
@@ -897,6 +1007,149 @@ def run_plan_then_act_agent(
     )
 
 
+def run_route_then_act_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+) -> tuple[list[str], str, str]:
+    selected_tools, routing_text = select_route_then_act_tools(
+        model=model,
+        tokenizer=tokenizer,
+        model_id=model_id,
+        query=query,
+        tools=tools,
+        max_new_tokens=max_new_tokens,
+    )
+    selected_tool_debug_names = [get_tool_debug_name(tool) for tool in selected_tools]
+    print(f"### Selected tools: {selected_tool_debug_names}")
+
+    function_calls, execution_response, error = run_hf_agent(
+        model=model,
+        tokenizer=tokenizer,
+        model_id=model_id,
+        query=query,
+        tools=selected_tools,
+        system_prompt=system_prompt,
+        max_iterations=max_iterations,
+        max_new_tokens=max_new_tokens,
+    )
+    full_response_parts = [
+        f"Routing response:\n{routing_text}",
+        f"Selected tools: {selected_tool_debug_names}",
+        execution_response,
+    ]
+    return function_calls, "\n".join(full_response_parts), error
+
+
+def run_self_reflection_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+) -> tuple[list[str], str, str]:
+    tool_schemas = [fn.openai_schema for fn in tools]
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": query},
+    ]
+    function_calls: list[str] = []
+    full_response_parts: list[str] = []
+
+    for _ in range(max_iterations):
+        reflection_messages = [
+            {"role": "system", "content": build_self_reflection_system_prompt(tools)},
+            *messages[1:],
+        ]
+        reflection_text = generate_assistant_turn(
+            model=model,
+            tokenizer=tokenizer,
+            messages=reflection_messages,
+            tools=None,
+            max_new_tokens=max_new_tokens,
+            model_id=model_id,
+        )
+        full_response_parts.append(f"Reflection:\n{reflection_text}")
+
+        execution_messages = messages + [
+            {
+                "role": "user",
+                "content": (
+                    "Self-reflection for the next step:\n"
+                    + reflection_text
+                    + "\n\nUse this reflection to decide the next tool call(s), or finish with a brief final answer if the task is complete."
+                ),
+            }
+        ]
+        assistant_text = generate_assistant_turn(
+            model=model,
+            tokenizer=tokenizer,
+            messages=execution_messages,
+            tools=tool_schemas,
+            max_new_tokens=max_new_tokens,
+            model_id=model_id,
+        )
+        full_response_parts.append(assistant_text)
+
+        parsed_tool_calls = parse_tool_calls(assistant_text)
+        if not parsed_tool_calls:
+            return function_calls, "\n".join(full_response_parts), ""
+
+        assistant_tool_calls = []
+        tool_result_messages = []
+
+        for tool_name, tool_args in parsed_tool_calls:
+            function_calls.append(convert_tool_call_to_function_call(tool_name, tool_args))
+            assistant_tool_calls.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": tool_args,
+                    },
+                }
+            )
+
+            fn = _TOOL_REGISTRY.get(tool_name)
+            if fn is None:
+                tool_result = f"Unknown tool: {tool_name}"
+            else:
+                try:
+                    tool_result = str(fn(**tool_args))
+                except Exception as exc:
+                    tool_result = f"Error executing tool: {exc}"
+
+            tool_result_messages.append(
+                {
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": tool_result,
+                }
+            )
+
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": assistant_tool_calls,
+            }
+        )
+        messages.extend(tool_result_messages)
+
+    return (
+        function_calls,
+        "\n".join(full_response_parts),
+        "Agent stopped due to iteration limit.",
+    )
+
+
 def run_agent(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -921,6 +1174,28 @@ def run_agent(
         )
     if agent_baseline == "plan_then_act":
         return run_plan_then_act_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+        )
+    if agent_baseline == "route_then_act":
+        return run_route_then_act_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+        )
+    if agent_baseline == "self_reflection":
+        return run_self_reflection_agent(
             model=model,
             tokenizer=tokenizer,
             model_id=model_id,
@@ -1043,6 +1318,16 @@ def generate_results_with_hf(
         if agent_baseline == "plan_then_act":
             print("### Planning system prompt:")
             print(build_plan_then_act_planning_system_prompt(first_tools))
+            print("\n### Execution system prompt:")
+            print(build_system_prompt(agent_baseline, first_tools))
+        elif agent_baseline == "route_then_act":
+            print("### Routing system prompt:")
+            print(build_route_then_act_routing_system_prompt(first_tools))
+            print("\n### Execution system prompt:")
+            print(build_system_prompt(agent_baseline, first_tools))
+        elif agent_baseline == "self_reflection":
+            print("### Reflection system prompt:")
+            print(build_self_reflection_system_prompt(first_tools))
             print("\n### Execution system prompt:")
             print(build_system_prompt(agent_baseline, first_tools))
         else:
