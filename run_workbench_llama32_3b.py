@@ -49,6 +49,7 @@ DEFAULT_QUERIES_PATH = os.path.join(
 )
 AGENT_BASELINE_CHOICES = (
     "tool_calling",
+    "chain_of_thought",
     "react",
     "plan_then_act",
     "route_then_act",
@@ -356,7 +357,7 @@ def parse_args() -> argparse.Namespace:
         "--agent_baseline",
         choices=list(AGENT_BASELINE_CHOICES),
         default="tool_calling",
-        help="Agent loop to use: native tool calling, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
+        help="Agent loop to use: native tool calling, a chain-of-thought text-action variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
     )
     parser.add_argument(
         "--max_iterations",
@@ -506,6 +507,15 @@ def build_plan_then_act_planning_system_prompt(tools: list[Any]) -> str:
     )
 
 
+def build_chain_of_thought_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "Think step by step before calling any tool. "
+        + "When a tool is needed, return a tool call. "
+        + "When you have finished all necessary tool calls, provide a brief final answer."
+    )
+
+
 def build_route_then_act_routing_system_prompt(tools: list[Any]) -> str:
     return (
         build_base_system_prompt()
@@ -585,6 +595,8 @@ def build_plan_then_act_execution_user_prompt(query: str, plan_text: str) -> str
 def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
     if agent_baseline == "tool_calling":
         return build_tool_calling_system_prompt()
+    if agent_baseline == "chain_of_thought":
+        return build_chain_of_thought_system_prompt()
     if agent_baseline == "plan_then_act":
         return build_tool_calling_system_prompt()
     if agent_baseline == "route_then_act":
@@ -1162,6 +1174,17 @@ def run_agent(
     agent_baseline: str,
 ) -> tuple[list[str], str, str]:
     if agent_baseline == "tool_calling":
+        return run_hf_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+        )
+    if agent_baseline == "chain_of_thought":
         return run_hf_agent(
             model=model,
             tokenizer=tokenizer,
