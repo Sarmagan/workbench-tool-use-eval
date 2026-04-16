@@ -13,6 +13,13 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from few_shot_utils import (
+    build_few_shot_messages_for_query,
+    format_few_shot_messages,
+    load_few_shot_examples_by_domain,
+    normalize_domain_name,
+)
+
 
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 WORKBENCH_ROOT = os.path.join(PROJECT_ROOT, "WorkBench")
@@ -40,6 +47,7 @@ from src.tools.toolkits import (  # noqa: E402
 
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_FEW_SHOT_K = 3
 DEFAULT_QUERIES_PATH = os.path.join(
     WORKBENCH_ROOT,
     "data",
@@ -50,6 +58,7 @@ DEFAULT_QUERIES_PATH = os.path.join(
 AGENT_BASELINE_CHOICES = (
     "tool_calling",
     "chain_of_thought",
+    "few_shot",
     "react",
     "plan_then_act",
     "route_then_act",
@@ -80,6 +89,25 @@ def convert_tool_call_to_function_call(tool_name: str, tool_args: dict[str, Any]
     internal_name = _openai_name_to_internal(tool_name)
     args = ", ".join(f'{key}="{value}"' for key, value in tool_args.items())
     return f"{internal_name}.func({args})"
+
+
+def normalize_domain_name(domain: str) -> str:
+    return {
+        "crm": "customer_relationship_manager",
+    }.get(domain, domain)
+
+
+def parse_domains_field(domains_value: Any) -> list[str]:
+    if not isinstance(domains_value, str):
+        return []
+    cleaned = domains_value.strip("][")
+    if not cleaned:
+        return []
+    return [
+        normalize_domain_name(domain)
+        for domain in cleaned.replace("'", "").split(", ")
+        if domain
+    ]
 
 
 def get_toolkits(toolkits: list[str]) -> list[Any]:
@@ -357,7 +385,13 @@ def parse_args() -> argparse.Namespace:
         "--agent_baseline",
         choices=list(AGENT_BASELINE_CHOICES),
         default="tool_calling",
-        help="Agent loop to use: native tool calling, a chain-of-thought text-action variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
+        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
+    )
+    parser.add_argument(
+        "--few_shot_k",
+        type=int,
+        default=DEFAULT_FEW_SHOT_K,
+        help="Number of fixed domain examples to prepend when --agent_baseline few_shot.",
     )
     parser.add_argument(
         "--max_iterations",
@@ -516,6 +550,18 @@ def build_chain_of_thought_system_prompt() -> str:
     )
 
 
+def build_few_shot_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "Before the real user request, you will be given worked examples for this domain. "
+        + "Treat those examples as demonstrations of the expected tool-use pattern. "
+        + "Prefer lookup and search tools before write tools whenever information must be resolved first. "
+        + "Follow the same argument formatting and tool-call style, but adapt the actions to the current request. "
+        + "When a tool is needed, return a tool call. "
+        + "After completing the necessary tool calls, provide a brief final answer."
+    )
+
+
 def build_route_then_act_routing_system_prompt(tools: list[Any]) -> str:
     return (
         build_base_system_prompt()
@@ -597,6 +643,8 @@ def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
         return build_tool_calling_system_prompt()
     if agent_baseline == "chain_of_thought":
         return build_chain_of_thought_system_prompt()
+    if agent_baseline == "few_shot":
+        return build_few_shot_system_prompt()
     if agent_baseline == "plan_then_act":
         return build_tool_calling_system_prompt()
     if agent_baseline == "route_then_act":
@@ -791,12 +839,13 @@ def run_hf_agent(
     system_prompt: str,
     max_iterations: int,
     max_new_tokens: int,
+    prefix_messages: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], str, str]:
     tool_schemas = [fn.openai_schema for fn in tools]
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query},
-    ]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    if prefix_messages:
+        messages.extend(prefix_messages)
+    messages.append({"role": "user", "content": query})
     function_calls: list[str] = []
     full_response_parts: list[str] = []
 
@@ -1172,6 +1221,7 @@ def run_agent(
     max_iterations: int,
     max_new_tokens: int,
     agent_baseline: str,
+    few_shot_messages: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], str, str]:
     if agent_baseline == "tool_calling":
         return run_hf_agent(
@@ -1194,6 +1244,18 @@ def run_agent(
             system_prompt=system_prompt,
             max_iterations=max_iterations,
             max_new_tokens=max_new_tokens,
+        )
+    if agent_baseline == "few_shot":
+        return run_hf_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+            prefix_messages=few_shot_messages,
         )
     if agent_baseline == "plan_then_act":
         return run_plan_then_act_agent(
@@ -1302,13 +1364,7 @@ def get_query_tools(
         )
 
     if tool_selection == "domains":
-        query_toolkits = (
-            queries_df["domains"]
-            .iloc[index]
-            .strip("][")
-            .replace("'", "")
-            .split(", ")
-        )
+        query_toolkits = parse_domains_field(queries_df["domains"].iloc[index])
         return get_toolkits(query_toolkits)
 
     raise ValueError(f"Unknown tool selection mode: {tool_selection}")
@@ -1327,7 +1383,12 @@ def generate_results_with_hf(
     num_retries: int,
     num_queries: int | None,
     print_first_prompt: bool,
+    few_shot_k: int,
 ) -> pd.DataFrame:
+    few_shot_examples_by_domain: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    if agent_baseline == "few_shot":
+        few_shot_examples_by_domain = load_few_shot_examples_by_domain()
+
     queries_df = pd.read_csv(queries_path)
     if num_queries is not None:
         queries_df = queries_df.head(num_queries).copy()
@@ -1353,6 +1414,19 @@ def generate_results_with_hf(
             print(build_self_reflection_system_prompt(first_tools))
             print("\n### Execution system prompt:")
             print(build_system_prompt(agent_baseline, first_tools))
+        elif agent_baseline == "few_shot":
+            first_examples = build_few_shot_messages_for_query(
+                examples_by_domain=few_shot_examples_by_domain,
+                current_domains=parse_domains_field(queries_df["domains"].iloc[0]),
+                available_tool_names={get_tool_name(tool) for tool in first_tools},
+                few_shot_k=few_shot_k,
+                tool_registry=_TOOL_REGISTRY,
+                domains=DOMAINS,
+            )
+            print("### System prompt:")
+            print(build_system_prompt(agent_baseline, first_tools))
+            print("\n### Few-shot examples:")
+            print(format_few_shot_messages(first_examples))
         else:
             first_system_prompt = build_system_prompt(agent_baseline, first_tools)
             print("### System prompt:")
@@ -1370,6 +1444,16 @@ def generate_results_with_hf(
             tool_selection,
         )
         system_prompt = build_system_prompt(agent_baseline, tools)
+        few_shot_messages = None
+        if agent_baseline == "few_shot":
+            few_shot_messages = build_few_shot_messages_for_query(
+                examples_by_domain=few_shot_examples_by_domain,
+                current_domains=parse_domains_field(queries_df["domains"].iloc[index]),
+                available_tool_names={get_tool_name(tool) for tool in tools},
+                few_shot_k=few_shot_k,
+                tool_registry=_TOOL_REGISTRY,
+                domains=DOMAINS,
+            )
         function_calls: list[str] = []
         full_response = ""
         error = ""
@@ -1385,6 +1469,7 @@ def generate_results_with_hf(
                 max_iterations=max_iterations,
                 max_new_tokens=max_new_tokens,
                 agent_baseline=agent_baseline,
+                few_shot_messages=few_shot_messages,
             )
 
             if not function_calls:
@@ -1400,6 +1485,7 @@ def generate_results_with_hf(
                         max_iterations=max_iterations,
                         max_new_tokens=max_new_tokens,
                         agent_baseline=agent_baseline,
+                        few_shot_messages=few_shot_messages,
                     )
                     if function_calls:
                         break
@@ -1464,6 +1550,7 @@ def main() -> None:
         num_retries=args.num_retries,
         num_queries=args.num_queries,
         print_first_prompt=args.print_first_prompt,
+        few_shot_k=args.few_shot_k,
     )
 
     ground_truth = pd.read_csv(args.queries_path)

@@ -1,5 +1,0 @@
-"query","function_calls","full_response","error"
-"Delete my last email from nadia","['email.delete_email.func(email_id=""last email id of nadia"")', 'email.delete_email.func(email_id=""last email id of nadia"")', 'email.delete_email.func(email_id=""last email id of nadia"")']","{""name"": ""email__delete_email"", ""parameters"": {""email_id"": ""last email id of nadia""}}<|eom_id|>
-{""name"": ""email__delete_email"", ""parameters"": {""email_id"": ""last email id of nadia""}}<|eom_id|>
-<|python_tag|>{""name"": ""email__delete_email"", ""parameters"": {""email_id"": ""last email id of nadia""}}<|eom_id|>
-The email ""last email id of nadia"" was not found.<|eot_id|>",""

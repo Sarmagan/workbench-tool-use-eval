@@ -1,9 +1,0 @@
-venv/
-.venv
-.DS_Store
-__pycache__/
-openai_key.txt
-anthropic_key.txt
-anyscale_key.txt
-downloads
-.vscode

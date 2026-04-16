@@ -1,6 +1,0 @@
-"query","function_calls","full_response","error"
-"Delete my last email from nadia","[]","","CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasCreate(handle)`"
-"Delete my last email from sofia","[]","","CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasCreate(handle)`"
-"Delete my last email from anaya","[]","","CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasCreate(handle)`"
-"nadia just sent me an email that I need to delete. Can you get rid of of the most recent email they sent me?","[]","","CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasCreate(handle)`"
-"Delete my last email from yuki","[]","","CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasCreate(handle)`"
