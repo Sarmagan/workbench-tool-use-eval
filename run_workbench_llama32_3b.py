@@ -8,7 +8,6 @@ import os
 import re
 import sys
 from typing import Any
-
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -48,6 +47,7 @@ from src.tools.toolkits import (  # noqa: E402
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_FEW_SHOT_K = 3
+DEFAULT_TOT_NUM_THOUGHTS = 3
 DEFAULT_QUERIES_PATH = os.path.join(
     WORKBENCH_ROOT,
     "data",
@@ -59,6 +59,7 @@ AGENT_BASELINE_CHOICES = (
     "tool_calling",
     "chain_of_thought",
     "few_shot",
+    "tree_of_thoughts",
     "react",
     "plan_then_act",
     "route_then_act",
@@ -385,13 +386,19 @@ def parse_args() -> argparse.Namespace:
         "--agent_baseline",
         choices=list(AGENT_BASELINE_CHOICES),
         default="tool_calling",
-        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
+        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, a Tree-of-Thoughts variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
     )
     parser.add_argument(
         "--few_shot_k",
         type=int,
         default=DEFAULT_FEW_SHOT_K,
         help="Number of fixed domain examples to prepend when --agent_baseline few_shot.",
+    )
+    parser.add_argument(
+        "--tot_num_thoughts",
+        type=int,
+        default=DEFAULT_TOT_NUM_THOUGHTS,
+        help="Number of candidate next steps to generate per Tree-of-Thoughts expansion.",
     )
     parser.add_argument(
         "--max_iterations",
@@ -561,6 +568,64 @@ def build_few_shot_system_prompt() -> str:
         + "After completing the necessary tool calls, provide a brief final answer."
     )
 
+# Shared ToT policy text is reused across expansion and judging so both phases
+# optimize for the same execution constraints.
+def build_tot_policy_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "Before each step, consider multiple plausible next actions and choose the single best next step before acting. "
+        + "Prefer prerequisite lookup, search, and read tools before write tools whenever identifiers or current state must be resolved first. "
+        + "Execute only one chosen next step at a time."
+    )
+
+
+# Expansion is the "propose branches" phase: generate structured candidates,
+# but do not execute anything yet.
+def build_tot_expand_prompt(
+    tools: list[Any],
+    num_thoughts: int,
+    policy_prompt: str,
+) -> str:
+    candidate_count = max(1, num_thoughts)
+    return (
+        policy_prompt
+        + f" You are in a Tree-of-Thoughts expansion phase. Return exactly {candidate_count} distinct candidate next steps with ids "
+        + f'"T1" through "T{candidate_count}". '
+        + "Do not call tools directly and do not answer the user request yet. "
+        + "Each candidate must be exactly one of these:\n"
+        + '1. a single tool call with an exact available tool name and JSON arguments, or\n'
+        + "2. a brief final answer, but only if the task is already complete.\n"
+        + "Prefer candidates that resolve missing IDs, names, emails, dates, or existing records before any write action. "
+        + "Keep reasoning brief and action-oriented. "
+        + 'Return exactly one JSON object with a top-level "thoughts" array and nothing else. '
+        + 'Each thought must include "id", "reasoning", and exactly one of "action" or "final_answer". '
+        + "Use this action shape when a tool is needed:\n"
+        + '{"id": "T1", "reasoning": "brief why this is promising", "action": {"name": "exact_tool_name", "arguments": {"arg": "value"}}}\n'
+        + "Use this final-answer shape only when the task is already complete:\n"
+        + '{"id": "T2", "reasoning": "brief why finishing is safe", "final_answer": "brief answer"}\n\n'
+        + "Available tools:\n"
+        + format_tools_for_text_prompt(tools)
+    )
+
+
+# Judging is a separate "select one branch" phase so execution only advances
+# along one candidate path per iteration.
+def build_tot_judge_prompt(
+    tools: list[Any],
+    policy_prompt: str,
+) -> str:
+    return (
+        policy_prompt
+        + " You are evaluating candidate thoughts in a Tree-of-Thoughts search. "
+        + "Do not call tools and do not answer the user request yet. "
+        + "Select the single best next step. "
+        + "Prefer the candidate that is most likely to complete the task safely and efficiently, uses exact available tool names, resolves missing information before write actions, and avoids premature final answers. "
+        + "Return exactly one JSON object with this schema and nothing else:\n"
+        + '{"best_thought_id": "T1", "reason": "brief justification"}\n\n'
+        + "Available tools:\n"
+        + format_tools_for_text_prompt(tools)
+    )
+
 
 def build_route_then_act_routing_system_prompt(tools: list[Any]) -> str:
     return (
@@ -645,6 +710,8 @@ def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
         return build_chain_of_thought_system_prompt()
     if agent_baseline == "few_shot":
         return build_few_shot_system_prompt()
+    if agent_baseline == "tree_of_thoughts":
+        return build_tot_policy_prompt()
     if agent_baseline == "plan_then_act":
         return build_tool_calling_system_prompt()
     if agent_baseline == "route_then_act":
@@ -761,6 +828,151 @@ def parse_selected_tool_names(text: str, tools: list[Any]) -> list[str]:
         if tool_name in text and tool_name not in selected_names:
             selected_names.append(tool_name)
     return selected_names
+
+
+# Normalize prompt-level schema variants into a single internal shape so the
+# execution loop does not depend on the exact JSON field names the model chose.
+def normalize_tree_of_thought_candidate(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+
+    candidate_id = payload.get("id")
+    if not isinstance(candidate_id, str) or not candidate_id.strip():
+        return None
+
+    reasoning = payload.get("reasoning", "")
+    if not isinstance(reasoning, str):
+        reasoning = ""
+
+    action_payload = payload.get("action")
+    if action_payload is None:
+        action_payload = payload.get("tool_call")
+    if action_payload is None:
+        action_payload = payload.get("tool")
+
+    normalized_action = normalize_tool_call(action_payload) if action_payload is not None else None
+    if normalized_action is not None:
+        tool_name, tool_args = normalized_action
+        return {
+            "id": candidate_id.strip(),
+            "reasoning": reasoning.strip(),
+            "kind": "tool_call",
+            "tool_name": tool_name,
+            "tool_args": tool_args,
+        }
+
+    final_answer = payload.get("final_answer")
+    if isinstance(final_answer, str) and final_answer.strip():
+        return {
+            "id": candidate_id.strip(),
+            "reasoning": reasoning.strip(),
+            "kind": "final_answer",
+            "final_answer": final_answer.strip(),
+        }
+
+    return None
+
+
+# First parse the intended structured output. If the model drifts from the
+# schema, degrade gracefully by treating raw tool calls or plain text as a
+# best-effort candidate instead of failing the entire turn.
+def parse_tree_of_thought_candidates(text: str) -> list[dict[str, Any]]:
+    for payload in extract_json_candidates(text):
+        thoughts = payload.get("thoughts")
+        if not isinstance(thoughts, list):
+            continue
+
+        candidates: list[dict[str, Any]] = []
+        for candidate_payload in thoughts:
+            normalized = normalize_tree_of_thought_candidate(candidate_payload)
+            if normalized is not None:
+                candidates.append(normalized)
+        if candidates:
+            return candidates
+
+    fallback_candidates: list[dict[str, Any]] = []
+    for index, (tool_name, tool_args) in enumerate(parse_tool_calls(text), start=1):
+        fallback_candidates.append(
+            {
+                "id": f"T{index}",
+                "reasoning": "",
+                "kind": "tool_call",
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+            }
+        )
+    if fallback_candidates:
+        return fallback_candidates
+
+    stripped_text = text.strip()
+    if not stripped_text:
+        return []
+
+    return [
+        {
+            "id": "T1",
+            "reasoning": "",
+            "kind": "final_answer",
+            "final_answer": stripped_text,
+        }
+    ]
+
+
+def format_tree_of_thought_candidates_for_judge(candidates: list[dict[str, Any]]) -> str:
+    formatted_candidates: list[str] = []
+    for candidate in candidates:
+        reasoning = candidate.get("reasoning") or "No reasoning provided."
+        if candidate["kind"] == "tool_call":
+            action_payload = {
+                "name": candidate["tool_name"],
+                "arguments": candidate["tool_args"],
+            }
+            formatted_candidates.append(
+                f'{candidate["id"]}\n'
+                f"Reasoning: {reasoning}\n"
+                f"Action: {json.dumps(action_payload, sort_keys=True)}"
+            )
+            continue
+
+        formatted_candidates.append(
+            f'{candidate["id"]}\n'
+            f"Reasoning: {reasoning}\n"
+            f'Final answer: {candidate["final_answer"]}'
+        )
+    return "\n\n".join(formatted_candidates)
+
+
+# The judge is supposed to return a single thought id, but weaker checkpoints
+# may drift slightly, so accept a few compatible JSON field names and finally a
+# textual mention of a valid id.
+def parse_selected_tree_of_thought_id(text: str, candidates: list[dict[str, Any]]) -> str | None:
+    available_ids = {candidate["id"] for candidate in candidates}
+
+    for payload in extract_json_candidates(text):
+        selected_id = payload.get("best_thought_id")
+        if selected_id is None:
+            selected_id = payload.get("selected_thought_id")
+        if selected_id is None:
+            selected_id = payload.get("id")
+        if isinstance(selected_id, str) and selected_id in available_ids:
+            return selected_id
+
+    for candidate in candidates:
+        candidate_id = candidate["id"]
+        if re.search(rf"\b{re.escape(candidate_id)}\b", text):
+            return candidate_id
+    return None
+
+
+def execute_tool_call(tool_name: str, tool_args: dict[str, Any]) -> str:
+    fn = _TOOL_REGISTRY.get(tool_name)
+    if fn is None:
+        return f"Unknown tool: {tool_name}"
+
+    try:
+        return str(fn(**tool_args))
+    except Exception as exc:
+        return f"Error executing tool: {exc}"
 
 
 def select_route_then_act_tools(
@@ -1211,6 +1423,138 @@ def run_self_reflection_agent(
     )
 
 
+def run_tree_of_thoughts_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+    num_thoughts: int,
+) -> tuple[list[str], str, str]:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": query}]
+    function_calls: list[str] = []
+    full_response_parts: list[str] = []
+
+    for _ in range(max_iterations):
+        # Phase 1: expand the current state into a small set of candidate next
+        # steps. This stays tool-free so we can compare alternatives first.
+        thought_messages = [
+            {
+                "role": "system",
+                "content": build_tot_expand_prompt(
+                    tools=tools,
+                    num_thoughts=num_thoughts,
+                    policy_prompt=system_prompt,
+                ),
+            },
+            *messages,
+        ]
+        thoughts_text = generate_assistant_turn(
+            model=model,
+            tokenizer=tokenizer,
+            messages=thought_messages,
+            tools=None,
+            max_new_tokens=max_new_tokens,
+            model_id=model_id,
+        )
+        full_response_parts.append(f"Thought candidates:\n{thoughts_text}")
+
+        candidates = parse_tree_of_thought_candidates(thoughts_text)
+        if not candidates:
+            return (
+                function_calls,
+                "\n".join(full_response_parts),
+                "Tree-of-thoughts expansion produced no valid candidates.",
+            )
+
+        selected_candidate = candidates[0]
+        if len(candidates) > 1:
+            # Phase 2: judge the proposed branches and pick the single best
+            # next step before mutating benchmark state.
+            judge_messages = [
+                {
+                    "role": "system",
+                    "content": build_tot_judge_prompt(
+                        tools=tools,
+                        policy_prompt=system_prompt,
+                    ),
+                },
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "Candidate next steps:\n"
+                        + format_tree_of_thought_candidates_for_judge(candidates)
+                        + "\n\nChoose the single best candidate for the next step."
+                    ),
+                },
+            ]
+            judge_text = generate_assistant_turn(
+                model=model,
+                tokenizer=tokenizer,
+                messages=judge_messages,
+                tools=None,
+                max_new_tokens=max_new_tokens,
+                model_id=model_id,
+            )
+            full_response_parts.append(f"Thought judge:\n{judge_text}")
+
+            selected_id = parse_selected_tree_of_thought_id(judge_text, candidates)
+            if selected_id is not None:
+                selected_candidate = next(
+                    candidate for candidate in candidates if candidate["id"] == selected_id
+                )
+
+        # Keep a compact trace of the chosen branch for debugging and result inspection.
+        full_response_parts.append(
+            "Selected thought:\n" + format_tree_of_thought_candidates_for_judge([selected_candidate])
+        )
+
+        if selected_candidate["kind"] == "final_answer":
+            full_response_parts.append(f'Final answer:\n{selected_candidate["final_answer"]}')
+            return function_calls, "\n".join(full_response_parts), ""
+
+        tool_name = selected_candidate["tool_name"]
+        tool_args = selected_candidate["tool_args"]
+        function_calls.append(convert_tool_call_to_function_call(tool_name, tool_args))
+        tool_result = execute_tool_call(tool_name, tool_args)
+        full_response_parts.append(f"Observation:\n{tool_result}")
+
+        # Persist only the executed branch in conversation state. Rejected
+        # branches remain in the debug trace but should not influence future
+        # turns as if they had actually happened.
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": tool_args,
+                        },
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "name": tool_name,
+                "content": tool_result,
+            }
+        )
+
+    return (
+        function_calls,
+        "\n".join(full_response_parts),
+        "Agent stopped due to iteration limit.",
+    )
+
+
 def run_agent(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -1222,6 +1566,7 @@ def run_agent(
     max_new_tokens: int,
     agent_baseline: str,
     few_shot_messages: list[dict[str, Any]] | None = None,
+    tot_num_thoughts: int = DEFAULT_TOT_NUM_THOUGHTS,
 ) -> tuple[list[str], str, str]:
     if agent_baseline == "tool_calling":
         return run_hf_agent(
@@ -1256,6 +1601,18 @@ def run_agent(
             max_iterations=max_iterations,
             max_new_tokens=max_new_tokens,
             prefix_messages=few_shot_messages,
+        )
+    if agent_baseline == "tree_of_thoughts":
+        return run_tree_of_thoughts_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+            num_thoughts=tot_num_thoughts,
         )
     if agent_baseline == "plan_then_act":
         return run_plan_then_act_agent(
@@ -1384,6 +1741,7 @@ def generate_results_with_hf(
     num_queries: int | None,
     print_first_prompt: bool,
     few_shot_k: int,
+    tot_num_thoughts: int,
 ) -> pd.DataFrame:
     few_shot_examples_by_domain: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     if agent_baseline == "few_shot":
@@ -1427,6 +1785,25 @@ def generate_results_with_hf(
             print(build_system_prompt(agent_baseline, first_tools))
             print("\n### Few-shot examples:")
             print(format_few_shot_messages(first_examples))
+        elif agent_baseline == "tree_of_thoughts":
+            first_system_prompt = build_system_prompt(agent_baseline, first_tools)
+            print("### Baseline system prompt:")
+            print(first_system_prompt)
+            print("\n### Thought generation system prompt:")
+            print(
+                build_tot_expand_prompt(
+                    tools=first_tools,
+                    num_thoughts=tot_num_thoughts,
+                    policy_prompt=first_system_prompt,
+                )
+            )
+            print("\n### Thought selection system prompt:")
+            print(
+                build_tot_judge_prompt(
+                    tools=first_tools,
+                    policy_prompt=first_system_prompt,
+                )
+            )
         else:
             first_system_prompt = build_system_prompt(agent_baseline, first_tools)
             print("### System prompt:")
@@ -1470,6 +1847,7 @@ def generate_results_with_hf(
                 max_new_tokens=max_new_tokens,
                 agent_baseline=agent_baseline,
                 few_shot_messages=few_shot_messages,
+                tot_num_thoughts=tot_num_thoughts,
             )
 
             if not function_calls:
@@ -1486,6 +1864,7 @@ def generate_results_with_hf(
                         max_new_tokens=max_new_tokens,
                         agent_baseline=agent_baseline,
                         few_shot_messages=few_shot_messages,
+                        tot_num_thoughts=tot_num_thoughts,
                     )
                     if function_calls:
                         break
@@ -1551,6 +1930,7 @@ def main() -> None:
         num_queries=args.num_queries,
         print_first_prompt=args.print_first_prompt,
         few_shot_k=args.few_shot_k,
+        tot_num_thoughts=args.tot_num_thoughts,
     )
 
     ground_truth = pd.read_csv(args.queries_path)
