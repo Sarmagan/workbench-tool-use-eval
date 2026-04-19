@@ -18,6 +18,11 @@ from few_shot_utils import (
     load_few_shot_examples_by_domain,
     normalize_domain_name,
 )
+from memory_utils import (
+    EpisodicMemory,
+    build_memory_messages_for_query,
+    format_memory_messages,
+)
 
 
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -48,6 +53,8 @@ from src.tools.toolkits import (  # noqa: E402
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_FEW_SHOT_K = 3
 DEFAULT_TOT_NUM_THOUGHTS = 3
+DEFAULT_MEMORY_K = 3
+DEFAULT_MEMORY_MIN_EPISODES = 1
 DEFAULT_QUERIES_PATH = os.path.join(
     WORKBENCH_ROOT,
     "data",
@@ -59,6 +66,7 @@ AGENT_BASELINE_CHOICES = (
     "tool_calling",
     "chain_of_thought",
     "few_shot",
+    "memory",
     "tree_of_thoughts",
     "react",
     "plan_then_act",
@@ -386,13 +394,39 @@ def parse_args() -> argparse.Namespace:
         "--agent_baseline",
         choices=list(AGENT_BASELINE_CHOICES),
         default="tool_calling",
-        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, a Tree-of-Thoughts variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
+        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, an episodic-memory retrieval variant, a Tree-of-Thoughts variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
     )
     parser.add_argument(
         "--few_shot_k",
         type=int,
         default=DEFAULT_FEW_SHOT_K,
         help="Number of fixed domain examples to prepend when --agent_baseline few_shot.",
+    )
+    parser.add_argument(
+        "--memory_k",
+        type=int,
+        default=DEFAULT_MEMORY_K,
+        help="Number of past episodes to retrieve as demonstrations when --agent_baseline memory.",
+    )
+    parser.add_argument(
+        "--memory_path",
+        default=None,
+        help=(
+            "Optional JSON file used to persist episodic memory across runs when "
+            "--agent_baseline memory. If unset, memory is kept in-process for the "
+            "current run only."
+        ),
+    )
+    parser.add_argument(
+        "--memory_min_episodes",
+        type=int,
+        default=DEFAULT_MEMORY_MIN_EPISODES,
+        help=(
+            "Cold-start guard for --agent_baseline memory: do not retrieve any "
+            "past episodes until the verified-correct store contains at least this "
+            "many entries. Set to 0 to retrieve from the very first query. "
+            f"Default: {DEFAULT_MEMORY_MIN_EPISODES}."
+        ),
     )
     parser.add_argument(
         "--tot_num_thoughts",
@@ -568,6 +602,18 @@ def build_few_shot_system_prompt() -> str:
         + "After completing the necessary tool calls, provide a brief final answer."
     )
 
+
+def build_memory_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "Before the real user request, you may be given a small set of retrieved past episodes that solved similar requests. "
+        + "Treat each retrieved episode as a demonstration of the expected tool-use pattern, but adapt the actions to the current request rather than copying values verbatim. "
+        + "If no past episodes are shown, proceed using the available tools alone. "
+        + "Prefer lookup and search tools before write tools whenever information must be resolved first. "
+        + "When a tool is needed, return a tool call. "
+        + "After completing the necessary tool calls, provide a brief final answer."
+    )
+
 # Shared ToT policy text is reused across expansion and judging so both phases
 # optimize for the same execution constraints.
 def build_tot_policy_prompt() -> str:
@@ -710,6 +756,8 @@ def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
         return build_chain_of_thought_system_prompt()
     if agent_baseline == "few_shot":
         return build_few_shot_system_prompt()
+    if agent_baseline == "memory":
+        return build_memory_system_prompt()
     if agent_baseline == "tree_of_thoughts":
         return build_tot_policy_prompt()
     if agent_baseline == "plan_then_act":
@@ -1052,6 +1100,7 @@ def run_hf_agent(
     max_iterations: int,
     max_new_tokens: int,
     prefix_messages: list[dict[str, Any]] | None = None,
+    recorded_outcome: dict[str, Any] | None = None,
 ) -> tuple[list[str], str, str]:
     tool_schemas = [fn.openai_schema for fn in tools]
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -1060,6 +1109,9 @@ def run_hf_agent(
     messages.append({"role": "user", "content": query})
     function_calls: list[str] = []
     full_response_parts: list[str] = []
+    if recorded_outcome is not None:
+        recorded_outcome.setdefault("actions", [])
+        recorded_outcome["final_answer"] = ""
 
     for _ in range(max_iterations):
         assistant_text = generate_assistant_turn(
@@ -1074,6 +1126,8 @@ def run_hf_agent(
 
         parsed_tool_calls = parse_tool_calls(assistant_text)
         if not parsed_tool_calls:
+            if recorded_outcome is not None:
+                recorded_outcome["final_answer"] = assistant_text.strip()
             return function_calls, "\n".join(full_response_parts), ""
 
         assistant_tool_calls = []
@@ -1081,6 +1135,10 @@ def run_hf_agent(
 
         for tool_name, tool_args in parsed_tool_calls:
             function_calls.append(convert_tool_call_to_function_call(tool_name, tool_args))
+            if recorded_outcome is not None:
+                recorded_outcome["actions"].append(
+                    {"name": tool_name, "arguments": tool_args}
+                )
             assistant_tool_calls.append(
                 {
                     "type": "function",
@@ -1566,6 +1624,8 @@ def run_agent(
     max_new_tokens: int,
     agent_baseline: str,
     few_shot_messages: list[dict[str, Any]] | None = None,
+    memory_messages: list[dict[str, Any]] | None = None,
+    recorded_outcome: dict[str, Any] | None = None,
     tot_num_thoughts: int = DEFAULT_TOT_NUM_THOUGHTS,
 ) -> tuple[list[str], str, str]:
     if agent_baseline == "tool_calling":
@@ -1601,6 +1661,19 @@ def run_agent(
             max_iterations=max_iterations,
             max_new_tokens=max_new_tokens,
             prefix_messages=few_shot_messages,
+        )
+    if agent_baseline == "memory":
+        return run_hf_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+            prefix_messages=memory_messages,
+            recorded_outcome=recorded_outcome,
         )
     if agent_baseline == "tree_of_thoughts":
         return run_tree_of_thoughts_agent(
@@ -1741,16 +1814,38 @@ def generate_results_with_hf(
     num_queries: int | None,
     print_first_prompt: bool,
     few_shot_k: int,
+    memory_k: int,
+    memory_path: str | None,
+    memory_min_episodes: int,
     tot_num_thoughts: int,
 ) -> pd.DataFrame:
     few_shot_examples_by_domain: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     if agent_baseline == "few_shot":
         few_shot_examples_by_domain = load_few_shot_examples_by_domain()
 
+    episodic_memory = EpisodicMemory()
+    if agent_baseline == "memory":
+        episodic_memory = EpisodicMemory.load(memory_path)
+        if memory_path:
+            print(
+                f"### Loaded {len(episodic_memory)} memory episode(s) from {memory_path}"
+            )
+
     queries_df = pd.read_csv(queries_path)
     if num_queries is not None:
         queries_df = queries_df.head(num_queries).copy()
     queries = queries_df["query"].tolist()
+
+    # Memory only stores episodes whose action trace would score as correct
+    # against ground truth. Without this gate, a query that runs without a
+    # Python exception but solves the wrong problem (e.g. fabricated emails,
+    # missing write actions) gets stored as a positive demonstration and
+    # poisons every subsequent retrieval in the same run.
+    ground_truth_actions_per_query: list[list[str]] = []
+    if agent_baseline == "memory":
+        ground_truth_actions_per_query = [
+            ast.literal_eval(answer) for answer in queries_df["answer"].tolist()
+        ]
     if print_first_prompt and queries:
         first_tools = get_query_tools(
             queries_df,
@@ -1785,6 +1880,24 @@ def generate_results_with_hf(
             print(build_system_prompt(agent_baseline, first_tools))
             print("\n### Few-shot examples:")
             print(format_few_shot_messages(first_examples))
+        elif agent_baseline == "memory":
+            if len(episodic_memory) >= memory_min_episodes:
+                first_memory_messages = build_memory_messages_for_query(
+                    memory=episodic_memory,
+                    query=queries[0],
+                    memory_k=memory_k,
+                    available_tool_names={get_tool_name(tool) for tool in first_tools},
+                    tool_registry=_TOOL_REGISTRY,
+                    domains=DOMAINS,
+                )
+            else:
+                first_memory_messages = []
+            print("### System prompt:")
+            print(build_system_prompt(agent_baseline, first_tools))
+            print(
+                f"\n### Retrieved memory episodes for first query (k={memory_k}, store size={len(episodic_memory)}, min_episodes={memory_min_episodes}):"
+            )
+            print(format_memory_messages(first_memory_messages))
         elif agent_baseline == "tree_of_thoughts":
             first_system_prompt = build_system_prompt(agent_baseline, first_tools)
             print("### Baseline system prompt:")
@@ -1831,6 +1944,26 @@ def generate_results_with_hf(
                 tool_registry=_TOOL_REGISTRY,
                 domains=DOMAINS,
             )
+        memory_messages = None
+        recorded_outcome: dict[str, Any] | None = None
+        if agent_baseline == "memory":
+            # Cold-start guard: while the verified-correct store is below the
+            # minimum, run memory-free instead of seeding the prompt with one
+            # or two unrepresentative early traces.
+            if len(episodic_memory) >= memory_min_episodes:
+                memory_messages = build_memory_messages_for_query(
+                    memory=episodic_memory,
+                    query=query,
+                    memory_k=memory_k,
+                    available_tool_names={get_tool_name(tool) for tool in tools},
+                    tool_registry=_TOOL_REGISTRY,
+                    domains=DOMAINS,
+                )
+            else:
+                print(
+                    f"### Memory: cold start ({len(episodic_memory)}/{memory_min_episodes} verified episodes); running without retrieval"
+                )
+            recorded_outcome = {"actions": [], "final_answer": ""}
         function_calls: list[str] = []
         full_response = ""
         error = ""
@@ -1847,12 +1980,16 @@ def generate_results_with_hf(
                 max_new_tokens=max_new_tokens,
                 agent_baseline=agent_baseline,
                 few_shot_messages=few_shot_messages,
+                memory_messages=memory_messages,
+                recorded_outcome=recorded_outcome,
                 tot_num_thoughts=tot_num_thoughts,
             )
 
             if not function_calls:
                 for retry_num in range(num_retries):
                     print(f"No actions taken. Retry {retry_num + 1} of {num_retries}")
+                    if recorded_outcome is not None:
+                        recorded_outcome = {"actions": [], "final_answer": ""}
                     function_calls, full_response, error = run_agent(
                         model=model,
                         tokenizer=tokenizer,
@@ -1864,6 +2001,8 @@ def generate_results_with_hf(
                         max_new_tokens=max_new_tokens,
                         agent_baseline=agent_baseline,
                         few_shot_messages=few_shot_messages,
+                        memory_messages=memory_messages,
+                        recorded_outcome=recorded_outcome,
                         tot_num_thoughts=tot_num_thoughts,
                     )
                     if function_calls:
@@ -1888,6 +2027,44 @@ def generate_results_with_hf(
             ],
             ignore_index=True,
         )
+
+        if (
+            agent_baseline == "memory"
+            and not error
+            and recorded_outcome is not None
+            and recorded_outcome.get("actions")
+        ):
+            ground_truth_actions = ground_truth_actions_per_query[index]
+            episode_is_correct = is_correct(
+                predicted_actions=function_calls,
+                ground_truth_actions=ground_truth_actions,
+                error="",
+            )
+            # is_correct compares benchmark state after replay. When ground
+            # truth itself is [] (no action needed), any sequence of read-only
+            # tool calls also yields the initial state and trivially passes.
+            # Those traces are not useful demonstrations and are often the
+            # exact failure mode we want to avoid teaching the model (e.g. a
+            # fabricated "<name>@example.com" search that happened to be a
+            # no-op because the target had no matching records). Require the
+            # ground truth to have at least one canonical action so a stored
+            # episode actually demonstrates how to act.
+            if not episode_is_correct:
+                print("### Memory: skipping incorrect episode")
+            elif not ground_truth_actions:
+                print(
+                    "### Memory: skipping no-op-correct episode (ground truth has no actions)"
+                )
+            else:
+                episodic_memory.add(
+                    query=query,
+                    actions=recorded_outcome["actions"],
+                    final_answer=recorded_outcome.get("final_answer", ""),
+                )
+                episodic_memory.save(memory_path)
+                print(
+                    f"### Memory: stored verified-correct episode (store size now {len(episodic_memory)})"
+                )
 
         for domain in DOMAINS:
             domain.reset_state()
@@ -1930,6 +2107,9 @@ def main() -> None:
         num_queries=args.num_queries,
         print_first_prompt=args.print_first_prompt,
         few_shot_k=args.few_shot_k,
+        memory_k=args.memory_k,
+        memory_path=args.memory_path,
+        memory_min_episodes=args.memory_min_episodes,
         tot_num_thoughts=args.tot_num_thoughts,
     )
 
