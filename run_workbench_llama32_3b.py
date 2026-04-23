@@ -55,6 +55,16 @@ DEFAULT_FEW_SHOT_K = 3
 DEFAULT_TOT_NUM_THOUGHTS = 3
 DEFAULT_MEMORY_K = 3
 DEFAULT_MEMORY_MIN_EPISODES = 1
+# Reflexion (Shinn et al., 2023) repeats the task across several trials and
+# keeps a small sliding window of verbal self-reflections written between
+# trials. The paper uses 1-3 reflections in the buffer and up to a small
+# number of trials per task; we mirror that with cost-aware defaults.
+DEFAULT_REFLEXION_MAX_TRIALS = 3
+DEFAULT_REFLEXION_MEMORY_SIZE = 3
+# The ReWOO Planner has to emit the entire multi-step plan in a single
+# generation call. The default per-turn token budget is enough for one tool
+# call but typically truncates a 3-4 step plan with brief reasoning lines.
+REWOO_PLANNER_MAX_NEW_TOKENS = 512
 DEFAULT_QUERIES_PATH = os.path.join(
     WORKBENCH_ROOT,
     "data",
@@ -72,6 +82,8 @@ AGENT_BASELINE_CHOICES = (
     "plan_then_act",
     "route_then_act",
     "self_reflection",
+    "rewoo",
+    "reflexion",
 )
 
 DOMAINS = [calendar, email, analytics, project_management, customer_relationship_manager]
@@ -394,7 +406,7 @@ def parse_args() -> argparse.Namespace:
         "--agent_baseline",
         choices=list(AGENT_BASELINE_CHOICES),
         default="tool_calling",
-        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, an episodic-memory retrieval variant, a Tree-of-Thoughts variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, or ReAct-style text actions.",
+        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, an episodic-memory retrieval variant, a Tree-of-Thoughts variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, ReAct-style text actions, ReWOO (Reasoning WithOut Observation) with a Planner/Worker/Solver split, or Reflexion (verbal reinforcement learning across trials).",
     )
     parser.add_argument(
         "--few_shot_k",
@@ -433,6 +445,27 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TOT_NUM_THOUGHTS,
         help="Number of candidate next steps to generate per Tree-of-Thoughts expansion.",
+    )
+    parser.add_argument(
+        "--reflexion_max_trials",
+        type=int,
+        default=DEFAULT_REFLEXION_MAX_TRIALS,
+        help=(
+            "Maximum number of Actor trials per query when --agent_baseline reflexion. "
+            "The first trial runs without reflections; subsequent trials see the verbal "
+            "reflections written by the Self-Reflection module after each failed trial. "
+            f"Default: {DEFAULT_REFLEXION_MAX_TRIALS}."
+        ),
+    )
+    parser.add_argument(
+        "--reflexion_memory_size",
+        type=int,
+        default=DEFAULT_REFLEXION_MEMORY_SIZE,
+        help=(
+            "Maximum number of past reflections kept in the Reflexion memory buffer "
+            "and shown to the Actor at the start of each new trial (sliding window). "
+            f"Default: {DEFAULT_REFLEXION_MEMORY_SIZE}."
+        ),
     )
     parser.add_argument(
         "--max_iterations",
@@ -704,6 +737,198 @@ def build_self_reflection_system_prompt(tools: list[Any]) -> str:
     )
 
 
+def build_rewoo_planner_system_prompt(tools: list[Any]) -> str:
+    return (
+        build_base_system_prompt()
+        + "You are the Planner in a ReWOO loop (Reasoning WithOut Observation). "
+        + "Decompose the task into a complete plan that fully solves it before any tool is executed. "
+        + "Do not call tools directly, do not return JSON tool calls, and do not include observations or final answers. "
+        + "Each step must be exactly two lines and use this format:\n"
+        + "Plan: <brief reasoning for this step>\n"
+        + "#E<n> = <exact_tool_name>[<JSON object with the tool arguments>]\n"
+        + "where <n> is the 1-based step index. "
+        + "You may reference earlier evidence by writing the bare token #E1, #E2, ... anywhere inside the JSON arguments; "
+        + "the worker will textually replace that exact token with the prior tool's output before execution. "
+        + "Strict reference rules: "
+        + "(1) Use only the bare token form (#E1, #E2, ...). "
+        + "(2) Do NOT use Python-style indexing or field access such as #E1[0], #E1.id, #E1['email_id'], or #E1.rows[0].field; "
+        + "the worker cannot resolve those. "
+        + "(3) If you need a single value (an id, an email, a date) that lives inside a structured prior observation, "
+        + "do not try to extract it inside the JSON arguments. Instead, plan a dedicated lookup step that returns just that single value "
+        + "(for example a get_*_by_id, find_*, or company directory lookup tool from the list below) and reference its bare #E<k> in the next step. "
+        + "Use exact tool names from the list below. "
+        + "Plan ALL the tool calls needed to fully complete the task, including any prerequisite lookup, search, or read steps required before write actions. "
+        + "Return only the sequence of (Plan, #E<n>) pairs and nothing else.\n\n"
+        + "Available tools:\n"
+        + format_tools_for_text_prompt(tools)
+    )
+
+
+def build_rewoo_solver_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "You are the Solver in a ReWOO loop. The Worker has already executed every tool call in the plan. "
+        + "Use the original task, the plan, and the collected evidence to write a brief final answer for the user. "
+        + "Do not call any tools and do not propose any further actions."
+    )
+
+
+def build_rewoo_arg_repair_system_prompt(
+    tool: Any,
+    args_template: str,
+    evidences: dict[str, str],
+) -> str:
+    schema = tool.openai_schema["function"]
+    properties = schema.get("parameters", {}).get("properties", {})
+    evidence_text = (
+        "\n".join(f"#{var} = {value}" for var, value in evidences.items())
+        if evidences
+        else "(no prior evidence)"
+    )
+    return (
+        build_base_system_prompt()
+        + "You are repairing arguments for a single tool call inside a ReWOO worker. "
+        + "The Planner emitted an argument template that contains #E references (and possibly Python-style accessors like #E1[0].field) "
+        + "that the worker could not resolve mechanically. "
+        + "Your job: read the resolved evidence below, figure out the single concrete value the Planner intended for each argument "
+        + "(typically one id, email address, date, or string copied from a row of a prior observation), "
+        + "and output exactly one JSON object containing those concrete arguments for the tool.\n\n"
+        + "Hard rules: "
+        + "(1) Output exactly one JSON object and nothing else - no prose, no markdown fences, no #E references in the output. "
+        + "(2) Every value in the output must be a concrete literal. Do NOT echo the template. "
+        + "Do NOT include any string of the form #E<n>, #E<n>[..], or #E<n>.field in the output. "
+        + "If you find yourself about to write any of those, stop and look up the actual value in the evidence below. "
+        + "(3) Use exact field names from the tool schema. "
+        + "(4) If a required value cannot be found in the evidence, omit that key rather than inventing one or echoing the placeholder.\n\n"
+        + f"Tool: {schema['name']}\n"
+        + f"Tool description: {schema.get('description', '')}\n"
+        + f"Parameters: {json.dumps(properties)}\n"
+        + f"Argument template from the Planner: {args_template}\n"
+        + "Evidence so far (each #E<n> = the full output of the n-th planned tool call):\n"
+        + evidence_text
+    )
+
+
+# Reflexion (Shinn et al., 2023) wires three LLM "modules" around a normal
+# tool-calling Actor: the Actor itself runs one full trial, an Evaluator judges
+# whether that trial succeeded, and a Self-Reflection module turns a failed
+# trial into a short verbal reflection that is appended to a bounded memory
+# buffer. The Actor sees the buffer at the start of every subsequent trial, so
+# memory is "verbal reinforcement" rather than weight updates.
+def build_reflexion_actor_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "Before the real user request, you may be given a short list of reflections written by the same agent after past failed attempts at this exact task. "
+        + "Treat each reflection as concrete guidance about what to do differently this attempt: which tool to call before another, which lookup to add before a write, which argument was wrong and what value to use instead. "
+        + "Do not repeat the past attempt's mistakes. "
+        + "If no reflections are shown, this is the first attempt; proceed using the available tools alone. "
+        + "When a tool is needed, return a tool call. "
+        + "When you have finished all necessary tool calls, provide a brief final answer."
+    )
+
+
+# The Evaluator is a separate LLM call that sees only the task and a textual
+# transcript of the Actor's trial. The paper allows the Evaluator to be ground
+# truth, an exact-match check, or an LM judge depending on the environment;
+# WorkBench has no automatic per-task success signal that could be used at
+# inference without leaking ground truth, so we use the LM-judge variant.
+def build_reflexion_evaluator_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "You are the Evaluator in a Reflexion loop. Read the user task and the transcript of one agent attempt (its tool calls, observations, and final answer). "
+        + "Decide whether the attempt successfully completed the task. "
+        + "Be strict: an attempt only succeeds if every requested side effect (write, update, delete, send, schedule, move, reassign, status change) was performed correctly with arguments that are consistent with the observations, and any requested information was actually retrieved and reported. "
+        + "Common failure modes to flag as failure: missing required write actions, fabricated identifiers/emails not verified by a prior search, wrong recipient or wrong values, premature termination before all needed steps, calling a non-existent tool, repeating the same failing call, or making no tool calls at all when the task clearly needs them. "
+        + "Return exactly one JSON object with this schema and nothing else:\n"
+        + '{"success": true, "reason": "brief justification"}\n'
+        + "or\n"
+        + '{"success": false, "reason": "brief justification of what is missing or wrong"}'
+    )
+
+
+# Self-Reflection turns (failed trial, evaluator verdict) into a short verbal
+# critique. The output goes into the Actor's prompt for the next trial, so it
+# must be concrete (tool names, argument fixes, missing prerequisite steps)
+# rather than generic advice.
+def build_reflexion_self_reflection_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "You are the Self-Reflection module in a Reflexion loop. The previous attempt at this task did not succeed according to the Evaluator. "
+        + "Read the original user request, the transcript of the failed attempt, and the Evaluator's reason. "
+        + "Write a short reflection (at most 3 sentences) diagnosing the concrete failure and stating exactly what the next attempt should do differently: which tool to call instead, which lookup to add before a write, which argument was wrong and what value to use instead. "
+        + "Mention exact tool names when useful. "
+        + "Do not include JSON, do not include tool-call syntax, and do not include the next plan or any executable actions. Output only the reflection text."
+    )
+
+
+def format_reflexion_trajectory(
+    actions: list[dict[str, Any]],
+    final_answer: str,
+) -> str:
+    lines: list[str] = []
+    for index, action in enumerate(actions, start=1):
+        name = action.get("name", "?")
+        try:
+            arguments_text = json.dumps(action.get("arguments", {}), sort_keys=True)
+        except (TypeError, ValueError):
+            arguments_text = str(action.get("arguments", {}))
+        observation = action.get("observation", "")
+        lines.append(f"Step {index}: {name}({arguments_text})")
+        lines.append(f"  Observation: {observation}")
+    if final_answer:
+        lines.append(f"Final answer: {final_answer}")
+    if not lines:
+        return "(no actions taken; no final answer)"
+    return "\n".join(lines)
+
+
+def format_reflexion_memory(reflections: list[str]) -> str:
+    if not reflections:
+        return "(none)"
+    return "\n".join(f"- {reflection}" for reflection in reflections)
+
+
+# Inline the reflection buffer into the user query rather than into the system
+# message or as a separate chat turn. That keeps the Actor's chat-template path
+# identical to the plain tool-calling baseline (no extra assistant turns to
+# confuse Qwen3 tool-call decoding) and ensures reflections are always grouped
+# with the task they critique.
+def build_reflexion_actor_user_query(query: str, reflections: list[str]) -> str:
+    if not reflections:
+        return query
+    return (
+        "Reflections written by the agent after previous failed attempts at this exact task:\n"
+        + format_reflexion_memory(reflections)
+        + "\n\nUser request:\n"
+        + query
+    )
+
+
+def parse_reflexion_evaluator_decision(text: str) -> tuple[bool, str]:
+    for payload in extract_json_candidates(text):
+        if "success" not in payload:
+            continue
+        success_value = payload["success"]
+        if isinstance(success_value, bool):
+            success = success_value
+        elif isinstance(success_value, str):
+            success = success_value.strip().lower() in {"true", "yes", "success", "succeeded"}
+        else:
+            success = bool(success_value)
+        reason = payload.get("reason", "")
+        if not isinstance(reason, str):
+            reason = json.dumps(reason)
+        return success, reason.strip()
+
+    # Fallback heuristics for weaker checkpoints that drift off the JSON schema.
+    lowered = text.lower()
+    if re.search(r"\bsuccess(ful|fully|ed)?\b", lowered) and not re.search(
+        r"\b(not|no|did not|failed|failure)\b", lowered
+    ):
+        return True, text.strip()
+    return False, text.strip()
+
+
 def format_tools_for_text_prompt(tools: list[Any]) -> str:
     formatted_tools: list[str] = []
     for fn in tools:
@@ -768,6 +993,10 @@ def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
         return build_tool_calling_system_prompt()
     if agent_baseline == "react":
         return build_react_system_prompt(tools)
+    if agent_baseline == "rewoo":
+        return build_rewoo_planner_system_prompt(tools)
+    if agent_baseline == "reflexion":
+        return build_reflexion_actor_system_prompt()
     raise ValueError(f"Unknown agent baseline: {agent_baseline}")
 
 
@@ -1135,10 +1364,10 @@ def run_hf_agent(
 
         for tool_name, tool_args in parsed_tool_calls:
             function_calls.append(convert_tool_call_to_function_call(tool_name, tool_args))
+            recorded_action: dict[str, Any] | None = None
             if recorded_outcome is not None:
-                recorded_outcome["actions"].append(
-                    {"name": tool_name, "arguments": tool_args}
-                )
+                recorded_action = {"name": tool_name, "arguments": tool_args}
+                recorded_outcome["actions"].append(recorded_action)
             assistant_tool_calls.append(
                 {
                     "type": "function",
@@ -1157,6 +1386,13 @@ def run_hf_agent(
                     tool_result = str(fn(**tool_args))
                 except Exception as exc:
                     tool_result = f"Error executing tool: {exc}"
+
+            # Reflexion needs (action, observation) pairs to build a transcript
+            # for the Evaluator and Self-Reflection LLM calls. Memory's
+            # _compress_actions rebuilds canonical {name, arguments} dicts so
+            # the extra "observation" key here is harmless for that baseline.
+            if recorded_action is not None:
+                recorded_action["observation"] = tool_result
 
             tool_result_messages.append(
                 {
@@ -1613,6 +1849,331 @@ def run_tree_of_thoughts_agent(
     )
 
 
+# Parse a ReWOO plan emitted by the Planner. The expected shape is a sequence
+# of (Plan, #E<n> = tool[args]) pairs; tool argument blocks may span multiple
+# lines and contain nested brackets, so the parser tracks bracket depth instead
+# of relying on a single-line regex.
+def parse_rewoo_plan(text: str) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    parts = re.split(r"(?:^|\n)\s*Plan\s*:\s*", text)
+    for part in parts[1:]:
+        action_match = re.search(r"#E(\d+)\s*=\s*([A-Za-z_][\w]*)\s*\[", part)
+        if not action_match:
+            continue
+        bracket_start = action_match.end()
+        depth = 1
+        cursor = bracket_start
+        while cursor < len(part) and depth > 0:
+            if part[cursor] == "[":
+                depth += 1
+            elif part[cursor] == "]":
+                depth -= 1
+            cursor += 1
+        if depth != 0:
+            continue
+        steps.append(
+            {
+                "thought": part[: action_match.start()].strip(),
+                "var": "E" + action_match.group(1),
+                "tool_name": action_match.group(2),
+                "args_template": part[bracket_start : cursor - 1].strip(),
+            }
+        )
+    return steps
+
+
+# Substitute earlier evidence into an argument template. Higher-numbered
+# variables are replaced first so that "#E10" does not collide with "#E1" when
+# both are present.
+def substitute_rewoo_evidences(template: str, evidences: dict[str, str]) -> str:
+    if not template:
+        return template
+    sorted_vars = sorted(evidences.keys(), key=lambda var: -int(var[1:]))
+    result = template
+    for var in sorted_vars:
+        result = result.replace(f"#{var}", evidences[var])
+    return result
+
+
+# The Worker tries pure textual substitution first, matching the paper. If the
+# evidence broke JSON validity (often the case when an observation is a long
+# DataFrame string from which a single id must be extracted), fall back to a
+# single small LLM repair call so the planned step can still execute.
+def resolve_rewoo_step_arguments(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    tool: Any,
+    args_template: str,
+    evidences: dict[str, str],
+    max_new_tokens: int,
+) -> tuple[dict[str, Any], str]:
+    substituted = substitute_rewoo_evidences(args_template, evidences)
+    try:
+        parsed = json.loads(substituted)
+        if isinstance(parsed, dict):
+            return parsed, substituted
+    except json.JSONDecodeError:
+        pass
+
+    repair_messages = [
+        {
+            "role": "system",
+            "content": build_rewoo_arg_repair_system_prompt(
+                tool=tool,
+                args_template=args_template,
+                evidences=evidences,
+            ),
+        },
+        {"role": "user", "content": "Produce the JSON arguments now."},
+    ]
+    repair_text = generate_assistant_turn(
+        model=model,
+        tokenizer=tokenizer,
+        messages=repair_messages,
+        tools=None,
+        max_new_tokens=max_new_tokens,
+        model_id=model_id,
+    )
+    for candidate in extract_json_candidates(repair_text):
+        if isinstance(candidate, dict):
+            return candidate, repair_text
+    return {}, repair_text
+
+
+def run_rewoo_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+) -> tuple[list[str], str, str]:
+    tool_by_name = {get_tool_name(tool): tool for tool in tools}
+    full_response_parts: list[str] = []
+
+    # Phase 1: Planner. The Planner produces the entire plan up-front,
+    # without seeing any tool observations. This is what makes ReWOO
+    # "reasoning without observation" - reasoning tokens are emitted once,
+    # not re-emitted with every observation as in ReAct.
+    planner_messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": query},
+    ]
+    # The Planner has to emit the full multi-step plan in a single generation.
+    # Use a larger token budget than the per-turn default so 3-4 step plans
+    # do not get truncated mid-bracket (which would silently drop steps).
+    planner_max_new_tokens = max(max_new_tokens, REWOO_PLANNER_MAX_NEW_TOKENS)
+    plan_text = generate_assistant_turn(
+        model=model,
+        tokenizer=tokenizer,
+        messages=planner_messages,
+        tools=None,
+        max_new_tokens=planner_max_new_tokens,
+        model_id=model_id,
+    )
+    full_response_parts.append(f"Plan:\n{plan_text}")
+
+    steps = parse_rewoo_plan(plan_text)
+    if not steps:
+        return [], "\n".join(full_response_parts), ""
+
+    # Phase 2: Worker. Execute steps in order, substituting #E<n> placeholders
+    # with the corresponding observation before calling the tool.
+    function_calls: list[str] = []
+    evidences: dict[str, str] = {}
+    for step in steps[:max_iterations]:
+        tool = tool_by_name.get(step["tool_name"])
+        if tool is None:
+            evidences[step["var"]] = f"Unknown tool: {step['tool_name']}"
+            full_response_parts.append(
+                f"Step #{step['var']}\n"
+                f"Thought: {step['thought']}\n"
+                f"Action: {step['tool_name']}[{step['args_template']}]\n"
+                f"Observation: unknown tool"
+            )
+            continue
+
+        args, resolved_text = resolve_rewoo_step_arguments(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            tool=tool,
+            args_template=step["args_template"],
+            evidences=evidences,
+            max_new_tokens=max_new_tokens,
+        )
+        function_calls.append(convert_tool_call_to_function_call(step["tool_name"], args))
+        observation = execute_tool_call(step["tool_name"], args)
+        evidences[step["var"]] = observation
+        full_response_parts.append(
+            f"Step #{step['var']}\n"
+            f"Thought: {step['thought']}\n"
+            f"Action: {step['tool_name']}({args})\n"
+            f"Resolved arguments: {resolved_text}\n"
+            f"Observation: {observation}"
+        )
+
+    iteration_limit_error = (
+        "Agent stopped due to iteration limit." if len(steps) > max_iterations else ""
+    )
+
+    # Phase 3: Solver. Synthesize a brief final answer from the original task,
+    # the plan, and the observations. The Solver does not emit tool calls; the
+    # Worker has already executed them all.
+    evidence_text = (
+        "\n".join(f"#{var} = {value}" for var, value in evidences.items())
+        if evidences
+        else "(no evidence collected)"
+    )
+    solver_messages: list[dict[str, Any]] = [
+        {"role": "system", "content": build_rewoo_solver_system_prompt()},
+        {
+            "role": "user",
+            "content": (
+                f"Task:\n{query}\n\n"
+                f"Plan:\n{plan_text}\n\n"
+                f"Evidence:\n{evidence_text}\n\n"
+                "Provide a brief final answer."
+            ),
+        },
+    ]
+    final_answer = generate_assistant_turn(
+        model=model,
+        tokenizer=tokenizer,
+        messages=solver_messages,
+        tools=None,
+        max_new_tokens=max_new_tokens,
+        model_id=model_id,
+    )
+    full_response_parts.append(f"Final answer:\n{final_answer}")
+
+    return function_calls, "\n".join(full_response_parts), iteration_limit_error
+
+
+def run_reflexion_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+    max_trials: int,
+    memory_size: int,
+) -> tuple[list[str], str, str]:
+    reflections: list[str] = []
+    full_response_parts: list[str] = []
+    last_function_calls: list[str] = []
+    last_error = ""
+    effective_max_trials = max(1, max_trials)
+    effective_memory_size = max(0, memory_size)
+
+    for trial_index in range(effective_max_trials):
+        # Reset benchmark state between trials. Reflexion treats every trial as
+        # a fresh attempt at the same task; without reset, side effects from
+        # prior trials would leak into the current trial's tool observations
+        # and corrupt the Evaluator's view of what the trial actually did.
+        for domain in DOMAINS:
+            domain.reset_state()
+
+        recorded: dict[str, Any] = {"actions": [], "final_answer": ""}
+        actor_query = build_reflexion_actor_user_query(query, reflections)
+        function_calls, trial_response, trial_error = run_hf_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=actor_query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+            recorded_outcome=recorded,
+        )
+        last_function_calls = function_calls
+        last_error = trial_error
+
+        full_response_parts.append(f"=== Trial {trial_index + 1} of {effective_max_trials} ===")
+        full_response_parts.append(
+            f"Reflections in buffer:\n{format_reflexion_memory(reflections)}"
+        )
+        full_response_parts.append(trial_response)
+
+        trajectory_text = format_reflexion_trajectory(
+            actions=recorded["actions"],
+            final_answer=recorded.get("final_answer", ""),
+        )
+
+        # Phase 2: Evaluator. LLM-as-judge over the textual trajectory.
+        evaluator_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": build_reflexion_evaluator_system_prompt()},
+            {
+                "role": "user",
+                "content": (
+                    f"User task:\n{query}\n\n"
+                    f"Agent attempt transcript:\n{trajectory_text}\n\n"
+                    "Did the attempt successfully complete the task? Return the JSON object now."
+                ),
+            },
+        ]
+        evaluator_text = generate_assistant_turn(
+            model=model,
+            tokenizer=tokenizer,
+            messages=evaluator_messages,
+            tools=None,
+            max_new_tokens=max_new_tokens,
+            model_id=model_id,
+        )
+        success, evaluator_reason = parse_reflexion_evaluator_decision(evaluator_text)
+        full_response_parts.append(
+            f"Evaluator (raw):\n{evaluator_text}\n"
+            f"Evaluator decision: success={success}, reason={evaluator_reason}"
+        )
+
+        if success:
+            return last_function_calls, "\n".join(full_response_parts), last_error
+
+        # No reflection needed after the final trial; the next attempt will
+        # never see it, so skip the extra LLM call.
+        if trial_index == effective_max_trials - 1:
+            break
+
+        # Phase 3: Self-Reflection. Turn the failed trial into one short verbal
+        # reflection and append it to the bounded memory buffer.
+        reflection_messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": build_reflexion_self_reflection_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User task:\n{query}\n\n"
+                    f"Agent attempt transcript:\n{trajectory_text}\n\n"
+                    f"Evaluator's verdict: failure. Reason: {evaluator_reason}\n\n"
+                    "Write the reflection now."
+                ),
+            },
+        ]
+        reflection_text = generate_assistant_turn(
+            model=model,
+            tokenizer=tokenizer,
+            messages=reflection_messages,
+            tools=None,
+            max_new_tokens=max_new_tokens,
+            model_id=model_id,
+        ).strip()
+        if reflection_text and effective_memory_size > 0:
+            reflections.append(reflection_text)
+            reflections = reflections[-effective_memory_size:]
+        full_response_parts.append(f"Reflection appended:\n{reflection_text}")
+
+    return last_function_calls, "\n".join(full_response_parts), last_error
+
+
 def run_agent(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -1627,6 +2188,8 @@ def run_agent(
     memory_messages: list[dict[str, Any]] | None = None,
     recorded_outcome: dict[str, Any] | None = None,
     tot_num_thoughts: int = DEFAULT_TOT_NUM_THOUGHTS,
+    reflexion_max_trials: int = DEFAULT_REFLEXION_MAX_TRIALS,
+    reflexion_memory_size: int = DEFAULT_REFLEXION_MEMORY_SIZE,
 ) -> tuple[list[str], str, str]:
     if agent_baseline == "tool_calling":
         return run_hf_agent(
@@ -1731,6 +2294,30 @@ def run_agent(
             max_iterations=max_iterations,
             max_new_tokens=max_new_tokens,
         )
+    if agent_baseline == "rewoo":
+        return run_rewoo_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+        )
+    if agent_baseline == "reflexion":
+        return run_reflexion_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+            max_trials=reflexion_max_trials,
+            memory_size=reflexion_memory_size,
+        )
     raise ValueError(f"Unknown agent baseline: {agent_baseline}")
 
 
@@ -1818,6 +2405,8 @@ def generate_results_with_hf(
     memory_path: str | None,
     memory_min_episodes: int,
     tot_num_thoughts: int,
+    reflexion_max_trials: int,
+    reflexion_memory_size: int,
 ) -> pd.DataFrame:
     few_shot_examples_by_domain: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     if agent_baseline == "few_shot":
@@ -1898,6 +2487,18 @@ def generate_results_with_hf(
                 f"\n### Retrieved memory episodes for first query (k={memory_k}, store size={len(episodic_memory)}, min_episodes={memory_min_episodes}):"
             )
             print(format_memory_messages(first_memory_messages))
+        elif agent_baseline == "rewoo":
+            print("### Planner system prompt:")
+            print(build_rewoo_planner_system_prompt(first_tools))
+            print("\n### Solver system prompt:")
+            print(build_rewoo_solver_system_prompt())
+        elif agent_baseline == "reflexion":
+            print("### Actor system prompt:")
+            print(build_reflexion_actor_system_prompt())
+            print("\n### Evaluator system prompt:")
+            print(build_reflexion_evaluator_system_prompt())
+            print("\n### Self-Reflection system prompt:")
+            print(build_reflexion_self_reflection_system_prompt())
         elif agent_baseline == "tree_of_thoughts":
             first_system_prompt = build_system_prompt(agent_baseline, first_tools)
             print("### Baseline system prompt:")
@@ -1983,6 +2584,8 @@ def generate_results_with_hf(
                 memory_messages=memory_messages,
                 recorded_outcome=recorded_outcome,
                 tot_num_thoughts=tot_num_thoughts,
+                reflexion_max_trials=reflexion_max_trials,
+                reflexion_memory_size=reflexion_memory_size,
             )
 
             if not function_calls:
@@ -2004,6 +2607,8 @@ def generate_results_with_hf(
                         memory_messages=memory_messages,
                         recorded_outcome=recorded_outcome,
                         tot_num_thoughts=tot_num_thoughts,
+                        reflexion_max_trials=reflexion_max_trials,
+                        reflexion_memory_size=reflexion_memory_size,
                     )
                     if function_calls:
                         break
@@ -2111,6 +2716,8 @@ def main() -> None:
         memory_path=args.memory_path,
         memory_min_episodes=args.memory_min_episodes,
         tot_num_thoughts=args.tot_num_thoughts,
+        reflexion_max_trials=args.reflexion_max_trials,
+        reflexion_memory_size=args.reflexion_memory_size,
     )
 
     ground_truth = pd.read_csv(args.queries_path)
