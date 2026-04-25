@@ -61,6 +61,8 @@ DEFAULT_MEMORY_MIN_EPISODES = 1
 # number of trials per task; we mirror that with cost-aware defaults.
 DEFAULT_REFLEXION_MAX_TRIALS = 3
 DEFAULT_REFLEXION_MEMORY_SIZE = 3
+DEFAULT_CRITIC_N = 2
+DEFAULT_CRITIC_VERIFY_MAX_ITERATIONS = 12
 # The ReWOO Planner has to emit the entire multi-step plan in a single
 # generation call. The default per-turn token budget is enough for one tool
 # call but typically truncates a 3-4 step plan with brief reasoning lines.
@@ -84,6 +86,7 @@ AGENT_BASELINE_CHOICES = (
     "self_reflection",
     "rewoo",
     "reflexion",
+    "critic",
 )
 
 DOMAINS = [calendar, email, analytics, project_management, customer_relationship_manager]
@@ -406,7 +409,7 @@ def parse_args() -> argparse.Namespace:
         "--agent_baseline",
         choices=list(AGENT_BASELINE_CHOICES),
         default="tool_calling",
-        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, an episodic-memory retrieval variant, a Tree-of-Thoughts variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, ReAct-style text actions, ReWOO (Reasoning WithOut Observation) with a Planner/Worker/Solver split, or Reflexion (verbal reinforcement learning across trials).",
+        help="Agent loop to use: native tool calling, a chain-of-thought variant, a few-shot prompting variant, an episodic-memory retrieval variant, a Tree-of-Thoughts variant, a route-then-act variant, a plan-then-act variant, a self-reflection variant, ReAct-style text actions, ReWOO (Reasoning WithOut Observation) with a Planner/Worker/Solver split, Reflexion (verbal reinforcement learning across trials), or CRITIC (tool-interactive verify-then-correct; Gou et al., arXiv:2305.11738).",
     )
     parser.add_argument(
         "--few_shot_k",
@@ -465,6 +468,26 @@ def parse_args() -> argparse.Namespace:
             "Maximum number of past reflections kept in the Reflexion memory buffer "
             "and shown to the Actor at the start of each new trial (sliding window). "
             f"Default: {DEFAULT_REFLEXION_MEMORY_SIZE}."
+        ),
+    )
+    parser.add_argument(
+        "--critic_n",
+        type=int,
+        default=DEFAULT_CRITIC_N,
+        help=(
+            "Paper hyperparameter n for --agent_baseline critic (Gou et al., Algorithm 1): "
+            "at most n tool-interactive verification passes; after each INCORRECT verdict "
+            "the draft is corrected with a fresh tool-calling run on reset benchmark state. "
+            f"Default: {DEFAULT_CRITIC_N}."
+        ),
+    )
+    parser.add_argument(
+        "--critic_verify_max_iterations",
+        type=int,
+        default=DEFAULT_CRITIC_VERIFY_MAX_ITERATIONS,
+        help=(
+            "Maximum assistant/tool turns allowed for each CRITIC verification pass "
+            f"(tool-interactive critique). Default: {DEFAULT_CRITIC_VERIFY_MAX_ITERATIONS}."
         ),
     )
     parser.add_argument(
@@ -929,6 +952,210 @@ def parse_reflexion_evaluator_decision(text: str) -> tuple[bool, str]:
     return False, text.strip()
 
 
+# CRITIC (Gou et al., 2023; arXiv:2305.11738): initialize a draft, then iterate
+# verify-with-tools and correction (Algorithm 1). Verification is a separate
+# native tool-calling episode on reset benchmark state so the critic can
+# cross-check the proposal without the prior attempt's side effects.
+def build_critic_verification_system_prompt() -> str:
+    return (
+        build_base_system_prompt()
+        + "You are the verification stage. "
+        + "Another model produced the proposed tool-call trace below. The benchmark has been reset to its initial state — use tools freely to check whether that trace would correctly fulfill the user request (consistency of arguments with tool observations, missing steps, wrong entities, hallucinated ids, etc.). "
+        + "You may re-run searches or lookups with the same parameters as in the proposal to compare results. "
+        + "When you are done calling tools, your final assistant message in this verification pass MUST contain a line exactly of the form:\n"
+        + "VERDICT: CORRECT\n"
+        + "or\n"
+        + "VERDICT: INCORRECT\n"
+        + "You may add a short justification on the following line.\n"
+        + "Emit the verdict only once you have sufficient evidence from tools or from establishing that the trace is empty or incoherent."
+    )
+
+
+def parse_critic_verdict(text: str) -> tuple[bool | None, str]:
+    match = re.search(r"VERDICT:\s*(CORRECT|INCORRECT)\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None, text.strip()
+    verdict_token = match.group(1).upper()
+    if verdict_token == "CORRECT":
+        return True, text.strip()
+    return False, text.strip()
+
+
+def build_critic_correction_user_query(
+    base_query: str, trajectory_text: str, verification_transcript: str
+) -> str:
+    return (
+        base_query
+        + "\n\nThe following was an earlier proposed solution on the same kind of "
+        "initial benchmark state (for context only; the live environment has been reset):\n"
+        + trajectory_text
+        + "\n\nTool-interactive verification (CRITIC critique) produced:\n"
+        + verification_transcript
+        + "\n\nUsing the critique and any tool evidence reproduced there, emit a corrected "
+        "solution for the original user request: call the necessary tools on the current "
+        "(fresh) state, then give a brief final natural-language answer when finished."
+    )
+
+
+def run_critic_verification_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    trajectory_text: str,
+    max_iterations: int,
+    max_new_tokens: int,
+) -> tuple[str, bool | None]:
+    tool_schemas = [fn.openai_schema for fn in tools]
+    system_prompt = build_critic_verification_system_prompt()
+    user_content = (
+        "User request:\n"
+        + query
+        + "\n\nProposed solution trace to verify (stepwise tool calls and observations "
+        "collected when this trace was executed once from the initial benchmark state):\n"
+        + trajectory_text
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    transcript_parts: list[str] = []
+
+    for _ in range(max_iterations):
+        assistant_text = generate_assistant_turn(
+            model=model,
+            tokenizer=tokenizer,
+            messages=messages,
+            tools=tool_schemas,
+            max_new_tokens=max_new_tokens,
+            model_id=model_id,
+        )
+        transcript_parts.append(assistant_text)
+        verdict, _ = parse_critic_verdict(assistant_text)
+        if verdict is True:
+            return "\n".join(transcript_parts), True
+        if verdict is False:
+            return "\n".join(transcript_parts), False
+
+        parsed_tool_calls = parse_tool_calls(assistant_text)
+        if not parsed_tool_calls:
+            tail_verdict, _ = parse_critic_verdict("\n".join(transcript_parts))
+            return "\n".join(transcript_parts), tail_verdict
+
+        assistant_tool_calls = []
+        tool_result_messages = []
+        for tool_name, tool_args in parsed_tool_calls:
+            assistant_tool_calls.append(
+                {
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": tool_args},
+                }
+            )
+            fn = _TOOL_REGISTRY.get(tool_name)
+            if fn is None:
+                tool_result = f"Unknown tool: {tool_name}"
+            else:
+                try:
+                    tool_result = str(fn(**tool_args))
+                except Exception as exc:
+                    tool_result = f"Error executing tool: {exc}"
+            tool_result_messages.append(
+                {"role": "tool", "name": tool_name, "content": tool_result}
+            )
+
+        messages.append({"role": "assistant", "tool_calls": assistant_tool_calls})
+        messages.extend(tool_result_messages)
+
+    joined = "\n".join(transcript_parts)
+    return joined, parse_critic_verdict(joined)[0]
+
+
+def run_critic_agent(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    query: str,
+    tools: list[Any],
+    system_prompt: str,
+    max_iterations: int,
+    max_new_tokens: int,
+    critic_n: int,
+    critic_verify_max_iterations: int,
+) -> tuple[list[str], str, str]:
+    effective_n = max(1, critic_n)
+    verify_cap = max(1, critic_verify_max_iterations)
+    full_response_parts: list[str] = []
+
+    for domain in DOMAINS:
+        domain.reset_state()
+
+    recorded: dict[str, Any] = {"actions": [], "final_answer": ""}
+    last_function_calls, init_response, last_error = run_hf_agent(
+        model=model,
+        tokenizer=tokenizer,
+        model_id=model_id,
+        query=query,
+        tools=tools,
+        system_prompt=system_prompt,
+        max_iterations=max_iterations,
+        max_new_tokens=max_new_tokens,
+        recorded_outcome=recorded,
+    )
+    full_response_parts.append(f"=== CRITIC initialization (draft ŷ) ===\n{init_response}")
+    trajectory_text = format_reflexion_trajectory(
+        recorded["actions"], recorded.get("final_answer", "")
+    )
+
+    for round_index in range(effective_n):
+        for domain in DOMAINS:
+            domain.reset_state()
+
+        verify_log, verdict_ok = run_critic_verification_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            trajectory_text=trajectory_text,
+            max_iterations=verify_cap,
+            max_new_tokens=max_new_tokens,
+        )
+        full_response_parts.append(
+            f"=== CRITIC verification pass {round_index + 1} of {effective_n} ===\n{verify_log}"
+        )
+
+        if verdict_ok is True:
+            return last_function_calls, "\n".join(full_response_parts), last_error
+
+        for domain in DOMAINS:
+            domain.reset_state()
+
+        correction_query = build_critic_correction_user_query(
+            query, trajectory_text, verify_log
+        )
+        recorded = {"actions": [], "final_answer": ""}
+        last_function_calls, correction_response, last_error = run_hf_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=correction_query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+            recorded_outcome=recorded,
+        )
+        full_response_parts.append(
+            f"=== CRITIC correction (after verify {round_index + 1}) ===\n{correction_response}"
+        )
+        trajectory_text = format_reflexion_trajectory(
+            recorded["actions"], recorded.get("final_answer", "")
+        )
+
+    return last_function_calls, "\n".join(full_response_parts), last_error
+
+
 def format_tools_for_text_prompt(tools: list[Any]) -> str:
     formatted_tools: list[str] = []
     for fn in tools:
@@ -997,6 +1224,8 @@ def build_system_prompt(agent_baseline: str, tools: list[Any]) -> str:
         return build_rewoo_planner_system_prompt(tools)
     if agent_baseline == "reflexion":
         return build_reflexion_actor_system_prompt()
+    if agent_baseline == "critic":
+        return build_tool_calling_system_prompt()
     raise ValueError(f"Unknown agent baseline: {agent_baseline}")
 
 
@@ -2190,6 +2419,8 @@ def run_agent(
     tot_num_thoughts: int = DEFAULT_TOT_NUM_THOUGHTS,
     reflexion_max_trials: int = DEFAULT_REFLEXION_MAX_TRIALS,
     reflexion_memory_size: int = DEFAULT_REFLEXION_MEMORY_SIZE,
+    critic_n: int = DEFAULT_CRITIC_N,
+    critic_verify_max_iterations: int = DEFAULT_CRITIC_VERIFY_MAX_ITERATIONS,
 ) -> tuple[list[str], str, str]:
     if agent_baseline == "tool_calling":
         return run_hf_agent(
@@ -2318,6 +2549,19 @@ def run_agent(
             max_trials=reflexion_max_trials,
             memory_size=reflexion_memory_size,
         )
+    if agent_baseline == "critic":
+        return run_critic_agent(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            query=query,
+            tools=tools,
+            system_prompt=system_prompt,
+            max_iterations=max_iterations,
+            max_new_tokens=max_new_tokens,
+            critic_n=critic_n,
+            critic_verify_max_iterations=critic_verify_max_iterations,
+        )
     raise ValueError(f"Unknown agent baseline: {agent_baseline}")
 
 
@@ -2407,6 +2651,8 @@ def generate_results_with_hf(
     tot_num_thoughts: int,
     reflexion_max_trials: int,
     reflexion_memory_size: int,
+    critic_n: int,
+    critic_verify_max_iterations: int,
 ) -> pd.DataFrame:
     few_shot_examples_by_domain: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     if agent_baseline == "few_shot":
@@ -2499,6 +2745,11 @@ def generate_results_with_hf(
             print(build_reflexion_evaluator_system_prompt())
             print("\n### Self-Reflection system prompt:")
             print(build_reflexion_self_reflection_system_prompt())
+        elif agent_baseline == "critic":
+            print("### Actor / correction system prompt (same as tool_calling):")
+            print(build_tool_calling_system_prompt())
+            print("\n### CRITIC verification system prompt:")
+            print(build_critic_verification_system_prompt())
         elif agent_baseline == "tree_of_thoughts":
             first_system_prompt = build_system_prompt(agent_baseline, first_tools)
             print("### Baseline system prompt:")
@@ -2586,6 +2837,8 @@ def generate_results_with_hf(
                 tot_num_thoughts=tot_num_thoughts,
                 reflexion_max_trials=reflexion_max_trials,
                 reflexion_memory_size=reflexion_memory_size,
+                critic_n=critic_n,
+                critic_verify_max_iterations=critic_verify_max_iterations,
             )
 
             if not function_calls:
@@ -2609,6 +2862,8 @@ def generate_results_with_hf(
                         tot_num_thoughts=tot_num_thoughts,
                         reflexion_max_trials=reflexion_max_trials,
                         reflexion_memory_size=reflexion_memory_size,
+                        critic_n=critic_n,
+                        critic_verify_max_iterations=critic_verify_max_iterations,
                     )
                     if function_calls:
                         break
@@ -2718,6 +2973,8 @@ def main() -> None:
         tot_num_thoughts=args.tot_num_thoughts,
         reflexion_max_trials=args.reflexion_max_trials,
         reflexion_memory_size=args.reflexion_memory_size,
+        critic_n=args.critic_n,
+        critic_verify_max_iterations=args.critic_verify_max_iterations,
     )
 
     ground_truth = pd.read_csv(args.queries_path)
